@@ -1,0 +1,36 @@
+# Pull the latest SEC Form 4 filings and post the buys that pass alerts.toml to Discord.
+# Started by insider-alerts.timer; see DEPLOY.md. Paths assume the project is in
+# /opt/insider-tracker -- change all four if it isn't.
+[Unit]
+Description=insider-tracker: post qualifying insider buys to Discord
+Documentation=file:///opt/insider-tracker/DEPLOY.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=insider
+Group=insider
+WorkingDirectory=/opt/insider-tracker
+# 4 days of overlap, matching max_age_days: a daily index the SEC published late is still
+# picked up (and posted) by a later run. Already-stored filings are skipped, not re-fetched.
+ExecStart=/bin/sh /opt/insider-tracker/deploy/run.sh alerts --ingest-days 4
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+TimeoutStartSec=2h
+Nice=10
+
+# The job needs outbound HTTPS (www.sec.gov, discord.com) and write access to data/. Nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/insider-tracker/data
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077

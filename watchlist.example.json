@@ -1,0 +1,7 @@
+{
+  "tickers": ["NVDA", "AAPL", "MSFT", "AMZN", "META", "LMT", "RTX", "PLTR"],
+  "managers_13f": {
+    "1067983": "Berkshire Hathaway",
+    "1336528": "Pershing Square"
+  }
+}

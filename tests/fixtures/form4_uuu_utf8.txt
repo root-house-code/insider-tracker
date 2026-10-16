@@ -1,0 +1,231 @@
+<SEC-DOCUMENT>0001214659-26-011872.txt : 20260922
+<SEC-HEADER>0001214659-26-011872.hdr.sgml : 20260922
+<ACCEPTANCE-DATETIME>20260922163020
+ACCESSION NUMBER:		0001214659-26-011872
+CONFORMED SUBMISSION TYPE:	4
+PUBLIC DOCUMENT COUNT:		1
+CONFORMED PERIOD OF REPORT:	20260918
+FILED AS OF DATE:		20260922
+DATE AS OF CHANGE:		20260922
+
+REPORTING-OWNER:	
+
+	OWNER DATA:	
+		COMPANY CONFORMED NAME:			AULT MILTON C III
+		CENTRAL INDEX KEY:			0001212502
+		ORGANIZATION NAME:           	
+		STATE OF INCORPORATION:			DE
+
+	FILING VALUES:
+		FORM TYPE:		4
+		SEC ACT:		1934 Act
+		SEC FILE NUMBER:	001-31747
+		FILM NUMBER:		261397204
+
+	MAIL ADDRESS:	
+		STREET 1:		11411 SOUTHERN HIGHLANDS PARKWAY
+		STREET 2:		SUITE 190
+		CITY:			LAS VEGAS
+		STATE:			NV
+		ZIP:			89141
+
+ISSUER:		
+
+	COMPANY DATA:	
+		COMPANY CONFORMED NAME:			UNIVERSAL SAFETY PRODUCTS, INC.
+		CENTRAL INDEX KEY:			0000102109
+		STANDARD INDUSTRIAL CLASSIFICATION:	WHOLESALE-ELECTRONIC PARTS & EQUIPMENT, NEC [5065]
+		ORGANIZATION NAME:           	07 Trade & Services
+		EIN:				520898545
+		STATE OF INCORPORATION:			MD
+		FISCAL YEAR END:			0331
+
+	BUSINESS ADDRESS:	
+		STREET 1:		11407 CRONHILL DRIVE, SUITES A-D
+		CITY:			OWINGS MILLS
+		STATE:			MD
+		ZIP:			21117-3586
+		BUSINESS PHONE:		4103633000
+
+	MAIL ADDRESS:	
+		STREET 1:		11407 CRONHILL DRIVE, SUITES A-D
+		CITY:			OWINGS MILLS
+		STATE:			MD
+		ZIP:			21117-3586
+
+	FORMER COMPANY:	
+		FORMER CONFORMED NAME:	UNIVERSAL SECURITY INSTRUMENTS INC
+		DATE OF NAME CHANGE:	19920703
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>4
+<SEQUENCE>1
+<FILENAME>doc4.xml
+<TEXT>
+<XML>
+<?xml version="1.0"?>
+<ownershipDocument>
+
+    <schemaVersion>X0609</schemaVersion>
+
+    <documentType>4</documentType>
+
+    <periodOfReport>2026-09-18</periodOfReport>
+
+    <notSubjectToSection16>0</notSubjectToSection16>
+
+    <issuer>
+        <issuerCik>0000102109</issuerCik>
+        <issuerName>UNIVERSAL SAFETY PRODUCTS, INC.</issuerName>
+        <issuerTradingSymbol>UUU</issuerTradingSymbol>
+        <issuerForeignTradingSymbol></issuerForeignTradingSymbol>
+    </issuer>
+
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0001212502</rptOwnerCik>
+            <rptOwnerName>AULT MILTON C III</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerAddress>
+            <rptOwnerNonUSAddressFlag>false</rptOwnerNonUSAddressFlag>
+            <rptOwnerStreet1>11411 SOUTHERN HIGHLANDS PARKWAY</rptOwnerStreet1>
+            <rptOwnerStreet2>SUITE 190</rptOwnerStreet2>
+            <rptOwnerCity>LAS VEGAS</rptOwnerCity>
+            <rptOwnerState>NV</rptOwnerState>
+            <rptOwnerZipCode>89141</rptOwnerZipCode>
+            <rptOwnerStateDescription></rptOwnerStateDescription>
+        </reportingOwnerAddress>
+        <reportingOwnerRelationship>
+            <isDirector>true</isDirector>
+            <isOfficer>false</isOfficer>
+            <isTenPercentOwner>true</isTenPercentOwner>
+            <isOther>false</isOther>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+
+    <aff10b5One>0</aff10b5One>
+
+    <nonDerivativeTable>
+        <nonDerivativeTransaction>
+            <securityTitle>
+                <value>Common Stock</value>
+            </securityTitle>
+            <transactionDate>
+                <value>2026-09-18</value>
+            </transactionDate>
+            <transactionCoding>
+                <transactionFormType>4</transactionFormType>
+                <transactionCode>P</transactionCode>
+                <equitySwapInvolved>0</equitySwapInvolved>
+            </transactionCoding>
+            <transactionAmounts>
+                <transactionShares>
+                    <value>100</value>
+                </transactionShares>
+                <transactionPricePerShare>
+                    <value>5.01</value>
+                </transactionPricePerShare>
+                <transactionAcquiredDisposedCode>
+                    <value>A</value>
+                </transactionAcquiredDisposedCode>
+            </transactionAmounts>
+            <postTransactionAmounts>
+                <sharesOwnedFollowingTransaction>
+                    <value>10300</value>
+                </sharesOwnedFollowingTransaction>
+            </postTransactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>D</value>
+                </directOrIndirectOwnership>
+            </ownershipNature>
+        </nonDerivativeTransaction>
+        <nonDerivativeHolding>
+            <securityTitle>
+                <value>Common Stock</value>
+            </securityTitle>
+            <postTransactionAmounts>
+                <sharesOwnedFollowingTransaction>
+                    <value>1133062</value>
+                </sharesOwnedFollowingTransaction>
+            </postTransactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>I</value>
+                </directOrIndirectOwnership>
+                <natureOfOwnership>
+                    <value>By Ault Lending, LLC</value>
+                    <footnoteId id="F1"/>
+                </natureOfOwnership>
+            </ownershipNature>
+        </nonDerivativeHolding>
+        <nonDerivativeHolding>
+            <securityTitle>
+                <value>Common Stock</value>
+            </securityTitle>
+            <postTransactionAmounts>
+                <sharesOwnedFollowingTransaction>
+                    <value>10000</value>
+                </sharesOwnedFollowingTransaction>
+            </postTransactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>D</value>
+                </directOrIndirectOwnership>
+            </ownershipNature>
+        </nonDerivativeHolding>
+        <nonDerivativeHolding>
+            <securityTitle>
+                <value>Common Stock</value>
+            </securityTitle>
+            <postTransactionAmounts>
+                <sharesOwnedFollowingTransaction>
+                    <value>22700</value>
+                </sharesOwnedFollowingTransaction>
+            </postTransactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>I</value>
+                </directOrIndirectOwnership>
+                <natureOfOwnership>
+                    <value>By Alpha Structured Finance LP</value>
+                    <footnoteId id="F2"/>
+                </natureOfOwnership>
+            </ownershipNature>
+        </nonDerivativeHolding>
+        <nonDerivativeHolding>
+            <securityTitle>
+                <value>Common Stock</value>
+            </securityTitle>
+            <postTransactionAmounts>
+                <sharesOwnedFollowingTransaction>
+                    <value>6200</value>
+                </sharesOwnedFollowingTransaction>
+            </postTransactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>I</value>
+                </directOrIndirectOwnership>
+                <natureOfOwnership>
+                    <value>By Ault &amp; Company, Inc.</value>
+                    <footnoteId id="F3"/>
+                </natureOfOwnership>
+            </ownershipNature>
+        </nonDerivativeHolding>
+    </nonDerivativeTable>
+
+    <footnotes>
+        <footnote id="F1">Ault Lending, LLC (“Ault Lending”), is a wholly owned subsidiary of Hyperscale Data, Inc. (“HSD”). Milton C. Ault, III, the Executive Chairman of HSD, is deemed to have voting and investment power with respect to the securities held of record by Ault Lending.</footnote>
+        <footnote id="F2">Securities beneficially owned by Alpha Structured Finance LP (“Alpha Fund”). Mr. Ault is the Manager of Alpha Structured Finance GP LLC (“Alpha GP”) and ACG Alpha Management LLC (“Alpha Management”). Alpha GP and Alpha Management are the general partner and investment manager to Alpha Fund, respectively. As a result of these relationships, Mr. Ault may be deemed to beneficially own the securities beneficially owned by Alpha Fund.</footnote>
+        <footnote id="F3">Securities beneficially owned by Ault &amp; Company, Inc. (“Ault &amp; Co.”). Mr. Ault is the Chief Executive Officer and Chairman of Ault &amp; Co. As a result of this relationship, Mr. Ault may be deemed to beneficially own the securities beneficially owned by Ault &amp; Co.</footnote>
+    </footnotes>
+
+    <ownerSignature>
+        <signatureName>By: /s/ Milton C. Ault, III</signatureName>
+        <signatureDate>2026-09-22</signatureDate>
+    </ownerSignature>
+</ownershipDocument>
+</XML>
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>

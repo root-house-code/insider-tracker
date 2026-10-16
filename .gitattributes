@@ -1,0 +1,7 @@
+# Store text with LF line endings in the repo, whatever the committer's platform.
+* text=auto
+# Files the Linux server runs keep Unix line endings, even when checked out or edited on Windows.
+deploy/** text eol=lf
+*.toml text eol=lf
+# Real filings saved byte for byte from the SEC; tests read them as bytes, so never convert them.
+tests/fixtures/** -text

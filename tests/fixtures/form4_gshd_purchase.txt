@@ -1,0 +1,167 @@
+<SEC-DOCUMENT>0001193125-26-401141.txt : 20260924
+<SEC-HEADER>0001193125-26-401141.hdr.sgml : 20260924
+<ACCEPTANCE-DATETIME>20260924170003
+ACCESSION NUMBER:		0001193125-26-401141
+CONFORMED SUBMISSION TYPE:	4
+PUBLIC DOCUMENT COUNT:		1
+CONFORMED PERIOD OF REPORT:	20260922
+FILED AS OF DATE:		20260924
+DATE AS OF CHANGE:		20260924
+
+REPORTING-OWNER:	
+
+	OWNER DATA:	
+		COMPANY CONFORMED NAME:			Durable Capital Partners LP
+		CENTRAL INDEX KEY:			0001798849
+		ORGANIZATION NAME:           	
+		STATE OF INCORPORATION:			DE
+		FISCAL YEAR END:			1231
+
+	FILING VALUES:
+		FORM TYPE:		4
+		SEC ACT:		1934 Act
+		SEC FILE NUMBER:	001-38466
+		FILM NUMBER:		261405290
+
+	BUSINESS ADDRESS:	
+		STREET 1:		4747 BETHESDA AVENUE
+		STREET 2:		SUITE #1002
+		CITY:			BETHESDA
+		STATE:			MD
+		ZIP:			20814
+		BUSINESS PHONE:		301-690-9567
+
+	MAIL ADDRESS:	
+		STREET 1:		4747 BETHESDA AVENUE
+		STREET 2:		SUITE #1002
+		CITY:			BETHESDA
+		STATE:			MD
+		ZIP:			20814
+
+ISSUER:		
+
+	COMPANY DATA:	
+		COMPANY CONFORMED NAME:			Goosehead Insurance, Inc.
+		CENTRAL INDEX KEY:			0001726978
+		STANDARD INDUSTRIAL CLASSIFICATION:	INSURANCE AGENTS BROKERS & SERVICES [6411]
+		ORGANIZATION NAME:           	02 Finance
+		EIN:				000000000
+		STATE OF INCORPORATION:			DE
+		FISCAL YEAR END:			1231
+
+	BUSINESS ADDRESS:	
+		STREET 1:		1500 SOLANA BLVD
+		STREET 2:		BUILDING 4, SUITE 4500
+		CITY:			WESTLAKE
+		STATE:			TX
+		ZIP:			76262
+		BUSINESS PHONE:		214-838-5500
+
+	MAIL ADDRESS:	
+		STREET 1:		1500 SOLANA BLVD
+		STREET 2:		BUILDING 4, SUITE 4500
+		CITY:			WESTLAKE
+		STATE:			TX
+		ZIP:			76262
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>4
+<SEQUENCE>1
+<FILENAME>ownership.xml
+<DESCRIPTION>4
+<TEXT>
+<XML>
+<?xml version="1.0"?>
+<ownershipDocument>
+
+    <schemaVersion>X0609</schemaVersion>
+
+    <documentType>4</documentType>
+
+    <periodOfReport>2026-09-22</periodOfReport>
+
+    <issuer>
+        <issuerCik>0001726978</issuerCik>
+        <issuerName>Goosehead Insurance, Inc.</issuerName>
+        <issuerTradingSymbol>GSHD</issuerTradingSymbol>
+        <issuerForeignTradingSymbol></issuerForeignTradingSymbol>
+    </issuer>
+
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0001798849</rptOwnerCik>
+            <rptOwnerName>Durable Capital Partners LP</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerAddress>
+            <rptOwnerNonUSAddressFlag>false</rptOwnerNonUSAddressFlag>
+            <rptOwnerStreet1>4747 BETHESDA AVENUE</rptOwnerStreet1>
+            <rptOwnerStreet2>SUITE 1002</rptOwnerStreet2>
+            <rptOwnerCity>BETHESDA</rptOwnerCity>
+            <rptOwnerState>MD</rptOwnerState>
+            <rptOwnerZipCode>20814</rptOwnerZipCode>
+            <rptOwnerStateDescription></rptOwnerStateDescription>
+        </reportingOwnerAddress>
+        <reportingOwnerRelationship>
+            <isDirector>false</isDirector>
+            <isOfficer>false</isOfficer>
+            <isTenPercentOwner>true</isTenPercentOwner>
+            <isOther>false</isOther>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+
+    <aff10b5One>false</aff10b5One>
+
+    <nonDerivativeTable>
+        <nonDerivativeTransaction>
+            <securityTitle>
+                <value>Class A Common Stock</value>
+            </securityTitle>
+            <transactionDate>
+                <value>2026-09-22</value>
+            </transactionDate>
+            <transactionCoding>
+                <transactionFormType>4</transactionFormType>
+                <transactionCode>P</transactionCode>
+                <equitySwapInvolved>false</equitySwapInvolved>
+            </transactionCoding>
+            <transactionAmounts>
+                <transactionShares>
+                    <value>150000</value>
+                </transactionShares>
+                <transactionPricePerShare>
+                    <value>47.32</value>
+                </transactionPricePerShare>
+                <transactionAcquiredDisposedCode>
+                    <value>A</value>
+                </transactionAcquiredDisposedCode>
+            </transactionAmounts>
+            <postTransactionAmounts>
+                <sharesOwnedFollowingTransaction>
+                    <value>2720260</value>
+                </sharesOwnedFollowingTransaction>
+            </postTransactionAmounts>
+            <ownershipNature>
+                <directOrIndirectOwnership>
+                    <value>I</value>
+                </directOrIndirectOwnership>
+                <natureOfOwnership>
+                    <value>See footnote (1)</value>
+                    <footnoteId id="F1"/>
+                </natureOfOwnership>
+            </ownershipNature>
+        </nonDerivativeTransaction>
+    </nonDerivativeTable>
+
+    <footnotes>
+        <footnote id="F1">The securities are held directly by Durable Capital Master Fund LP (&quot;Durable Capital Master Fund&quot;). Durable Capital Partners LP (&quot;Durable Capital&quot;) acts as the investment adviser to Durable Capital Master Fund and has sole voting power and sole investment power over the securities reported on this Form 4. Durable Capital Partners GP LLC (&quot;Durable GP&quot;) is the general partner of Durable Capital, and Henry Ellenbogen is the chief investment officer of Durable Capital and the managing member of Durable GP. Each of Durable Capital Master Fund, Durable Capital, Durable GP and Mr. Ellenbogen disclaim beneficial ownership of the reported securities, except to the extent of any pecuniary interest therein.</footnote>
+    </footnotes>
+
+    <ownerSignature>
+        <signatureName>Durable Capital Partners LP, By: Julie Jack, its Authorized Person</signatureName>
+        <signatureDate>2026-09-24</signatureDate>
+    </ownerSignature>
+</ownershipDocument>
+</XML>
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>

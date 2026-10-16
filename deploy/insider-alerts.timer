@@ -1,0 +1,13 @@
+# Tuesday to Saturday at 6:00 New York time, whatever time zone this server is in: by then the
+# SEC has published the previous business day's filing index, so each morning's posts cover
+# yesterday's filings. Persistent= runs a missed morning as soon as the server is back up.
+[Unit]
+Description=Run insider-tracker alerts each weekday morning
+
+[Timer]
+OnCalendar=Tue..Sat *-*-* 06:00:00 America/New_York
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

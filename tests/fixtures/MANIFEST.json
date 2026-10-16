@@ -1,0 +1,74 @@
+[
+  {
+    "file": "form4_gshd_purchase.txt",
+    "accession": "0001193125-26-401141",
+    "form_type": "4",
+    "filed_date": "2026-09-24",
+    "url": "https://www.sec.gov/Archives/edgar/data/1726978/0001193125-26-401141.txt",
+    "bytes": 5719,
+    "non_ascii_bytes": 0
+  },
+  {
+    "file": "form4_aapl_10b5-1_sale.txt",
+    "accession": "0001140361-26-037584",
+    "form_type": "4",
+    "filed_date": "2026-09-24",
+    "url": "https://www.sec.gov/Archives/edgar/data/1780525/0001140361-26-037584.txt",
+    "bytes": 4822,
+    "non_ascii_bytes": 0
+  },
+  {
+    "file": "form4_uuu_utf8.txt",
+    "accession": "0001214659-26-011872",
+    "form_type": "4",
+    "filed_date": "2026-09-22",
+    "url": "https://www.sec.gov/Archives/edgar/data/102109/0001214659-26-011872.txt",
+    "bytes": 8593,
+    "non_ascii_bytes": 36
+  },
+  {
+    "file": "senate_ptr_b999bc0e.html",
+    "source": "senate",
+    "doc_id": "b999bc0e-3eb0-4ca9-ab07-8e8f2e04b41f",
+    "member": "Alan Armstrong",
+    "filed_date": "2026-09-17",
+    "url": "https://efdsearch.senate.gov/search/view/ptr/b999bc0e-3eb0-4ca9-ab07-8e8f2e04b41f/",
+    "chars": 17151,
+    "rows_parsed": 4,
+    "tickers_stated": 2,
+    "tickers_recovered": 2,
+    "note": "eFD leaves the Ticker column as '--' for ADRs and similar; the symbol is only in the asset name, and is recovered with parse_quality='name_ticker'."
+  },
+  {
+    "file": "house_ptr_20035203.txt",
+    "source": "house",
+    "doc_id": "20035203",
+    "member": "Hon. Mike Kelly",
+    "state_district": "PA16",
+    "filed_date": "2026-08-12",
+    "url": "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20035203.pdf",
+    "chars": 1607,
+    "nul_bytes": 210,
+    "note": "Extracted PDF text with NUL bytes preserved. Chosen because it has BOTH tickered rows and tickerless rows whose asset text the NUL-padded 'F\u0000\u0000\u0000\u0000\u0000 S\u0000\u0000\u0000\u0000\u0000: New' markers used to corrupt."
+  },
+  {
+    "file": "yahoo_chart_example.json",
+    "source": "yahoo",
+    "synthetic": true,
+    "url": "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1mo&interval=1d",
+    "note": "Invented data (a fictional 'Example Homes Corporation', ticker EXH) in exactly the structure of a real response captured 2026-10-14: same keys, types and list lengths, and the real bar timestamps. Yahoo's terms don't allow redistributing its data, so the real capture stays out of git (tests/fixtures/local/, git-ignored). This structure is the contract prices.parse_chart must keep honouring; if Yahoo changes format, capture a fresh response into local/ and rebuild this file to match."
+  },
+  {
+    "file": "yahoo_profile_example.json",
+    "source": "yahoo",
+    "synthetic": true,
+    "url": "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=assetProfile (needs cookie from fc.yahoo.com + crumb)",
+    "note": "Invented data (a fictional 'Example Homes Corporation', ticker EXH) in exactly the structure of a real response captured 2026-10-14: same keys, types and list lengths, and the real bar timestamps. Yahoo's terms don't allow redistributing its data, so the real capture stays out of git (tests/fixtures/local/, git-ignored). This structure is the contract profiles.parse_yahoo must keep honouring; if Yahoo changes format, capture a fresh response into local/ and rebuild this file to match."
+  },
+  {
+    "file": "sec_submissions_len.json",
+    "source": "sec",
+    "url": "https://data.sec.gov/submissions/CIK0000920760.json",
+    "note": "Real response for Lennar with the (very long) 'filings' section removed; only the identity fields profiles.parse_sec reads are kept."
+  }
+]

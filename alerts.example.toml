@@ -1,0 +1,56 @@
+# Discord alert rules for insider-tracker.
+# Copy this file to alerts.toml and edit it. Then check what it would do before going live:
+#
+#   python -m insider_tracker alerts --backtest 20   # what these rules would have posted lately
+#   python -m insider_tracker alerts --dry-run       # what would post right now
+#
+# Every rule only looks at open-market purchases (Form 4 code P) of a company's own stock,
+# outside pre-scheduled 10b5-1 plans. Grants, option exercises and sales never post.
+# Dollar amounts are plain numbers; underscores are just for reading (250_000 = 250000).
+
+[settings]
+# Only post trades whose filing reached the SEC in the last N days. Stops the first run (or a
+# run after a long gap) from dumping weeks of old history into the channel.
+max_age_days = 4
+
+# Skip any filing claiming more than this in total. Real insider buys this big are vanishingly
+# rare; filer typos are not (one filing put a $2.27M total in the per-share price field).
+max_filing_value = 1_000_000_000
+
+# Shown under every post.
+footer = "Not investment advice."
+
+# Name of the environment variable holding the Discord webhook URL. Rules can override it
+# (webhook_env = "...") to post to a different channel.
+webhook_env = "DISCORD_WEBHOOK_URL"
+
+# Name the bot posts under.
+username = "insider-tracker"
+
+
+# Several different insiders at one company buying within a window: the strongest signal.
+[[rule]]
+name = "Cluster buy"                # also how already-posted trades are remembered: renaming
+type = "cluster_buy"                # a rule makes it treat everything as new again
+window_days = 14                    # purchases this recent count toward a cluster
+min_insiders = 2                    # different people (joint filings count once)
+min_value_per_insider = 25_000      # people buying less than this don't count at all: filters
+                                    # out employee-plan style $2-5k buys by dozens of staff
+min_total_value = 250_000           # combined, across the insiders who count
+cooldown_days = 0                   # 0 = re-post whenever a new trade joins the cluster (marked
+                                    # as an update); N = at most one post per company per N days
+# tickers = ["NVDA", "AAPL"]        # only these companies (omit for all)
+# exclude_tickers = ["SPY"]         # never these
+
+
+# One officer's or director's big purchase in a single filing.
+[[rule]]
+name = "Large officer/director buy"
+type = "large_buy"
+min_value = 500_000
+roles = ["officer", "director"]     # any of: officer, director, ten_pct (10% owners, often funds)
+cooldown_days = 7                   # one post per insider per company per 7 days: an insider
+                                    # buying every day is one story, not five posts
+window_days = 14
+# tickers = []
+# exclude_tickers = []

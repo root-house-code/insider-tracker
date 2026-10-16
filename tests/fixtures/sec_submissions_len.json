@@ -1,0 +1,20 @@
+{
+ "cik": "0000920760",
+ "name": "LENNAR CORP /NEW/",
+ "tickers": [
+  "LEN",
+  "LEN-B"
+ ],
+ "exchanges": [
+  "NYSE",
+  "NYSE"
+ ],
+ "sic": "1520",
+ "sicDescription": "General Bldg Contractors - Residential Bldgs",
+ "category": "Large accelerated filer",
+ "stateOfIncorporation": "DE",
+ "fiscalYearEnd": "1130",
+ "website": "",
+ "description": "",
+ "entityType": "operating"
+}
