@@ -51,7 +51,7 @@ def _csv(path: Path, rows):
 SECTIONS = [
     ("cluster_buys", "Insider cluster buys (2+ insiders, open market, no 10b5-1)",
      lambda c, s: signals.cluster_buys(c, s),
-     ["ticker", "issuer_name", "insiders", "total_value", "first_buy", "last_buy", "who"]),
+     ["ticker", "issuer_name", "insiders", "roles", "total_value", "first_buy", "last_buy", "who"]),
     ("large_buys", "Large insider purchases by officers and directors",
      lambda c, s: signals.large_buys(c, s),
      ["trans_date", "ticker", "owner_name", "relationship", "shares", "price", "value", "url"]),

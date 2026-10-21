@@ -11,7 +11,36 @@ All insider queries use only code 'P'/'S' (open-market) and exclude
 10b5-1 plan trades. Grants, option exercises and tax withholding are noise.
 SELECT DISTINCT on the economic fields collapses Form 4/A duplicates.
 """
+import re
+
 from . import config
+
+# Short role labels for a cluster, most senior first. Officer titles on Form 4 are free text
+# ("CEO", "Pres. & CEO", "Principal Executive Officer"), so the top titles are matched by
+# pattern -- and only for filers who ticked the Officer box, since "CEO of Sub Advisor" is
+# someone else's CEO. Officers matching none of them still show up, as "Officer".
+TITLES = [
+    ("CEO", re.compile(r"\b(co-?)?ceo\b|chief executive|principal executive", re.I)),
+    ("President", re.compile(r"\bpres(ident)?\b(?!\.? of)", re.I)),
+    ("CFO", re.compile(r"\bcfo\b|chief financial|principal financial", re.I)),
+    ("COO", re.compile(r"\b(co-?)?coo\b|chief operating", re.I)),
+    ("Chair", re.compile(r"\bchair", re.I)),
+]
+NOT_TITLES = re.compile(r"vice[\s-]*pres\w*\.?|vice[\s-]*chair\w*", re.I)
+ROLE_ORDER = [t for t, _ in TITLES] + ["Officer", "Director", "10% owner", "Other"]
+
+
+def roles(relationship, is_director, is_officer, is_ten_pct) -> set:
+    """The role labels one filer's Form 4 relationship maps to."""
+    text = NOT_TITLES.sub(" ", relationship or "")
+    found = {t for t, rx in TITLES if (is_officer or t == "Chair") and rx.search(text)}
+    if is_officer and not found - {"Chair"}:
+        found.add("Officer")
+    if is_director:
+        found.add("Director")
+    if is_ten_pct:
+        found.add("10% owner")
+    return found or {"Other"}
 
 
 def _rows(conn, sql, params=()):
@@ -19,7 +48,7 @@ def _rows(conn, sql, params=()):
 
 
 def cluster_buys(conn, since: str, min_insiders: int = 2):
-    return _rows(conn, """
+    rows = _rows(conn, """
         WITH buys AS (
           SELECT DISTINCT ticker, issuer_name, owner_name, trans_date, shares, price, value
           FROM insider_tx
@@ -29,6 +58,15 @@ def cluster_buys(conn, since: str, min_insiders: int = 2):
                GROUP_CONCAT(DISTINCT owner_name) AS who
         FROM buys GROUP BY ticker HAVING insiders >= ?
         ORDER BY insiders DESC, total_value DESC""", (since, min_insiders))
+    found = {}
+    for r in conn.execute("""
+            SELECT DISTINCT ticker, relationship, is_director, is_officer, is_ten_pct FROM insider_tx
+            WHERE code='P' AND is_derivative=0 AND plan_10b5_1=0 AND ticker<>'' AND trans_date>=?""",
+            (since,)):
+        found.setdefault(r[0], set()).update(roles(*r[1:]))
+    for row in rows:  # bare-comma list, like GROUP_CONCAT's `who`, so the filter can pick one role
+        row["roles"] = ",".join(t for t in ROLE_ORDER if t in found.get(row["ticker"], ()))
+    return rows
 
 
 def large_buys(conn, since: str, min_value: float = config.LARGE_BUY_USD, limit: int = 30):

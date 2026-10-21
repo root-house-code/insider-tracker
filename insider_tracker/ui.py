@@ -200,6 +200,10 @@ COLUMN_HELP = {
                   "director, which is why purchases by 10% owners don't appear in that view.",
     "is_ten_pct": "1 if the reporting owner holds 10% or more of the company. Usually a fund "
                   "rather than an individual.",
+    "roles": "Who the buyers are, most senior first: CEO, President, CFO, COO, Chair, then Officer "
+             "(any other officer title), Director, 10% owner. Read from each filer's Form 4 title, "
+             "which is free text, so an unusual spelling lands under Officer rather than being lost. "
+             "Filter to CEO or CFO to see the clusters the top executives joined.",
     "who": "The insiders making up this cluster. Watch for one person appearing twice -- once "
            "alone and once inside a semicolon-joined multi-owner string -- which inflates the "
            "insider count.",
@@ -284,7 +288,7 @@ VIEWS = [
        [Param("min_insiders", "min insiders", 2, int,
               "How many different insiders must buy before a company shows up. Two is the "
               "usual bar. Raise it to 3 or more to cut the list down to the strongest cases.")],
-       ["ticker", "issuer_name", "insiders", "total_value", "first_buy", "last_buy", "who"],
+       ["ticker", "issuer_name", "insiders", "roles", "total_value", "first_buy", "last_buy", "who"],
        "Two or more insiders at one company buying on the open market (code P), "
        "outside 10b5-1 plans. The strongest signal here.",
        "Several insiders at the same company buying on the open market at the same time. The "
@@ -446,7 +450,7 @@ CODES = {
 }
 TX_TYPES = {"P": "buy", "S": "sell", "E": "exchange"}
 # Columns holding a GROUP_CONCAT list rather than a single value.
-LIST_COLS = {"who", "member_names"}
+LIST_COLS = {"who", "member_names", "roles"}
 
 MONEY_COLS = {"value", "total_value", "min_total_usd", "value_now", "value_usd",
               "amount_low", "amount_high", "min_bought_usd", "min_sold_usd"}

@@ -1107,6 +1107,39 @@ def test_source_stays_python_311_compatible():
     assert not problems, "needs Python 3.12+:\n  " + "\n  ".join(sorted(set(problems)))
 
 
+def test_cluster_roles_from_free_text_titles():
+    """Form 4 officer titles are free text; the roles column must read the common spellings and
+    not mistake a vice president, a division head or someone else's CEO for the top job."""
+    label = lambda rel, d=0, o=1, t=0: ",".join(r for r in signals.ROLE_ORDER if r in signals.roles(rel, d, o, t))
+    assert label("Director, President and CEO", d=1) == "CEO,President,Director"
+    assert label("Pres. & CEO") == "CEO,President" and label("EVP and CFO") == "CFO"
+    assert label("Principal Financial Officer") == "CFO" and label("EVP and Co-COO") == "COO"
+    assert label("CEO, Co Founder & Chairman") == "CEO,Chair"
+    assert label("Vicepresident") == label("Senior Vice President") == label("Vice-Pres.") == "Officer"
+    assert label("Pres. of N. Am. / Europe Ops") == label("President of Pennsylvania") == "Officer"
+    assert label("CO-CEO of Sub Advisor", o=0) == "Other", "not an officer of this company"
+    assert label("Chairman", o=0) == "Chair" and label("Vice Chairman", d=1, o=0) == "Director"
+    assert label("10% Owner", o=0, t=1) == "10% owner" and label("Director, CTO", d=1) == "Officer,Director"
+
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [
+            _trade("r1", who="Ann", cik="1", relationship="Director, Chief Executive Officer", is_director=1),
+            _trade("r2", who="Bob", cik="2", relationship="Director", is_officer=0, is_director=1),
+            _trade("r3", who="Cy", cik="3", relationship="CFO", day="2026-10-12"),
+            _trade("r4", who="Dee", cik="4", ticker="OTHR", issuer_cik="9", relationship="Director",
+                   is_officer=0, is_director=1),
+            _trade("r5", who="Eve", cik="5", ticker="OTHR", issuer_cik="9", relationship="10% Owner",
+                   is_officer=0, is_ten_pct=1),
+            _trade("r6", who="Fay", cik="6", ticker="OTHR", issuer_cik="9", relationship="CEO", code="A")])
+        conn.commit()
+        got = {r["ticker"]: r["roles"] for r in signals.cluster_buys(conn, "2026-10-01")}
+        assert got == {"ACME": "CEO,CFO,Director", "OTHR": "Director,10% owner"}, got
+        # one role picked from the dropdown keeps the clusters that include it
+        page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "sf_roles": ["CEO"]})
+        assert "1 of 2 rows" in page and "CEO &middot; CFO &middot; Director" in page
+
+
 def test_ui_sorting():
     """Column sorting: numeric order, text order, and blanks always last."""
     rows = [{"t": "b", "v": 5.0}, {"t": "a", "v": 100.0}, {"t": "c", "v": None},
