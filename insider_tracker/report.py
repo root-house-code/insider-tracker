@@ -21,6 +21,8 @@ def _fmt(key, v):
         return ""
     if key in ("value", "total_value", "value_now", "min_total_usd"):
         return _money(v)
+    if key in ("stake_change", "max_stake_change"):
+        return signals.stake_text(v)
     if key == "price":
         return f"${v:,.2f}"
     if key in ("shares", "shares_after", "shares_prior", "shares_now") and isinstance(v, (int, float)):
@@ -45,16 +47,18 @@ def _csv(path: Path, rows):
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
         w.writeheader()
-        w.writerows(rows)
+        w.writerows(signals.csv_safe(rows))
 
 
 SECTIONS = [
     ("cluster_buys", "Insider cluster buys (2+ insiders, open market, no 10b5-1)",
      lambda c, s: signals.cluster_buys(c, s),
-     ["ticker", "issuer_name", "insiders", "roles", "total_value", "first_buy", "last_buy", "who"]),
+     ["ticker", "issuer_name", "insiders", "roles", "max_stake_change", "total_value", "first_buy",
+      "last_buy", "who"]),
     ("large_buys", "Large insider purchases by officers and directors",
      lambda c, s: signals.large_buys(c, s),
-     ["trans_date", "ticker", "owner_name", "relationship", "shares", "price", "value", "url"]),
+     ["trans_date", "ticker", "owner_name", "relationship", "shares", "price", "value", "stake_change",
+      "url"]),
     ("overlap", "Tickers bought by both Congress members and insiders",
      lambda c, s: signals.overlap(c, s),
      ["ticker", "members", "member_names", "insiders"]),

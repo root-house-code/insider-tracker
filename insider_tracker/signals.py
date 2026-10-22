@@ -11,6 +11,8 @@ All insider queries use only code 'P'/'S' (open-market) and exclude
 10b5-1 plan trades. Grants, option exercises and tax withholding are noise.
 SELECT DISTINCT on the economic fields collapses Form 4/A duplicates.
 """
+import datetime as dt
+import math
 import re
 
 from . import config
@@ -43,6 +45,75 @@ def roles(relationship, is_director, is_officer, is_ten_pct) -> set:
     return found or {"Other"}
 
 
+def stake_text(pct) -> str:
+    """'+25%', '+0.4%' or 'new' (a position that started from nothing)."""
+    if pct is None:
+        return ""
+    if pct == math.inf:
+        return "new"
+    return f"+{pct:,.0f}%" if pct >= 10 else f"+{pct:.1f}%"
+
+
+def csv_safe(rows):
+    """Rows for a CSV file: a brand-new position is written 'new', not 'inf'."""
+    return [{k: ("new" if v == math.inf else v) for k, v in r.items()} for r in rows]
+
+
+def insider_stake(conn, trades):
+    """stake_change for one insider's purchases, counting the other holdings their first filing
+    in the set reports (Table I holding rows). Later filings' holding rows are left out: by then a
+    holding bought into earlier would be counted twice."""
+    if not trades:
+        return None
+    first = min(trades, key=lambda t: (t.get("filed_date") or "", t["accession"]))["accession"]
+    held = _rows(conn, "SELECT security, shares FROM insider_holdings WHERE accession=?", (first,))
+    return stake_change(trades, held)
+
+
+def stake_change(trades, holdings=()):
+    """How much a set of one insider's purchases grew the holdings they went into, in percent;
+    math.inf for a position that started from nothing; None when the filings can't say.
+
+    Form 4's "shares owned following" is per holding line, and one insider can buy into several
+    of them at once -- shares held directly, plus one or more trusts or funds (indirect) -- each
+    with its own running balance. The filing names which trust, but we don't store that, so the
+    lines are recovered by chaining: a purchase continues the holding whose last balance equals
+    its own starting balance. Lines are separated by share class and direct/indirect first, and
+    only the class most of the shares went into is counted (classes aren't comparable shares).
+    A sale between two purchases breaks a chain into two; that errs low, never high.
+
+    `holdings` are the filing's other lines (shares held with no transaction, in a different
+    trust or directly); those in the same share class add to the position before and after."""
+    good = [t for t in trades if (t.get("shares") or 0) > 0 and t.get("shares_after") is not None]
+    if not good or any(t["shares_after"] < t["shares"] - 0.5 for t in good):
+        return None  # a balance smaller than the purchase itself: bad data, don't guess
+    by_class = {}
+    for t in good:
+        by_class.setdefault(t.get("security") or "", []).append(t)
+    main = max(by_class.values(), key=lambda ts: sum(t["shares"] for t in ts))
+    before = after = 0.0
+    for kind in {t.get("direct_indirect") or "" for t in main}:
+        # dedupe restatements (a 4/A repeats the same line), then chain in balance order
+        lines = sorted({(t["trans_date"], t["shares"], t["shares_after"]) for t in main
+                        if (t.get("direct_indirect") or "") == kind}, key=lambda x: (x[0], x[2]))
+        chains = []  # [starting balance, latest balance]
+        for _, shares, owned in lines:
+            start = owned - shares
+            link = next((c for c in chains if abs(c[1] - start) <= 1), None)
+            if link:
+                link[1] = owned
+            else:
+                chains.append([start, owned])
+        before += sum(c[0] for c in chains)
+        after += sum(c[1] for c in chains)
+    main_class = main[0].get("security") or ""
+    other = sum(h["shares"] or 0 for h in holdings if (h.get("security") or "") == main_class)
+    before, after = before + other, after + other
+    if after - before <= 0:
+        return None
+    return math.inf if before < 0.5 else 100 * (after - before) / before
+
+
 def _rows(conn, sql, params=()):
     return [dict(r) for r in conn.execute(sql, params)]
 
@@ -58,25 +129,117 @@ def cluster_buys(conn, since: str, min_insiders: int = 2):
                GROUP_CONCAT(DISTINCT owner_name) AS who
         FROM buys GROUP BY ticker HAVING insiders >= ?
         ORDER BY insiders DESC, total_value DESC""", (since, min_insiders))
-    found = {}
-    for r in conn.execute("""
-            SELECT DISTINCT ticker, relationship, is_director, is_officer, is_ten_pct FROM insider_tx
+    found, bought = {}, {}
+    for r in _rows(conn, """
+            SELECT DISTINCT ticker, owner_name, relationship, is_director, is_officer, is_ten_pct,
+                   security, direct_indirect, trans_date, shares, shares_after, accession, filed_date
+            FROM insider_tx
             WHERE code='P' AND is_derivative=0 AND plan_10b5_1=0 AND ticker<>'' AND trans_date>=?""",
             (since,)):
-        found.setdefault(r[0], set()).update(roles(*r[1:]))
+        found.setdefault(r["ticker"], set()).update(
+            roles(r["relationship"], r["is_director"], r["is_officer"], r["is_ten_pct"]))
+        bought.setdefault(r["ticker"], {}).setdefault(r["owner_name"], []).append(r)
     for row in rows:  # bare-comma list, like GROUP_CONCAT's `who`, so the filter can pick one role
         row["roles"] = ",".join(t for t in ROLE_ORDER if t in found.get(row["ticker"], ()))
+        stakes = [s for s in (insider_stake(conn, ts) for ts in bought.get(row["ticker"], {}).values())
+                  if s is not None]
+        row["max_stake_change"] = max(stakes) if stakes else None
     return rows
 
 
+BREADTH_MIN_HOLDERS = 20  # fund_breadth needs this many holders now...
+BREADTH_MIN_BEFORE = 10   # ...and this many the quarter before (else it's a new listing, or too few)
+
+
+def fund_overlap(conn, since: str, min_insiders: int = 1, min_net_funds: int = 1):
+    """Stocks insiders bought in the window that institutions were also net buying in the latest
+    13F quarter (funds.py): more managers opened or added (>5%) than cut or exited. Same rows and
+    columns as cluster_buys, plus the fund columns. Empty until the 13F data sets are loaded."""
+    from . import funds, prices  # funds is only needed by this view
+    meta = funds.latest(conn)
+    if not meta:
+        return []
+    flows = funds.flows_by_ticker(conn, meta["period"])
+    alias = {}
+    for t, f in flows.items():
+        for c in [t, *prices.candidates(t)]:
+            alias.setdefault(c, f)
+    tracked = funds.tracked_by_cusip(conn, meta["period"])
+    out = []
+    for r in cluster_buys(conn, since, min_insiders):
+        f = next((alias[c] for c in [r["ticker"], *prices.candidates(r["ticker"])] if c in alias), None)
+        if not f:
+            continue
+        net = (f["new"] + f["added"]) - (f["cut"] + f["exited"])
+        if net < min_net_funds:
+            continue
+        mine = []
+        for name, now, before in sorted(tracked.get(f["cusip"], []), key=lambda x: x[0] or ""):
+            if before and now:
+                change = f"{100 * (now / before - 1):+.0f}%" if abs(now / before - 1) > 0.005 else "held"
+            else:
+                change = "new" if now else "exited"
+            mine.append(f"{name} {change}")
+        # Net buyers as a share of holders: size-neutral, so a mega-cap's routine churn (hundreds of
+        # funds either way) doesn't outrank a smaller stock being discovered. Only where there is a
+        # real base to measure against: a stock nobody held last quarter is usually a fresh listing
+        # (every holder "new", 100%), and 7 of 7 holders is too few to mean anything.
+        before = f["holders"] - f["new"] + f["exited"]
+        breadth = (100 * net / f["holders"]
+                   if f["holders"] >= BREADTH_MIN_HOLDERS and before >= BREADTH_MIN_BEFORE else None)
+        out.append({**r, "net_funds": net, "fund_breadth": breadth,
+                    "funds_new": f["new"], "funds_added": f["added"],
+                    "funds_cut": f["cut"], "funds_exited": f["exited"], "fund_holders": f["holders"],
+                    "fund_shares_change": (100 * (f["shares"] / f["prior_shares"] - 1)) if f["prior_shares"] else None,
+                    "tracked_funds": ",".join(mine)})
+    return out
+
+
+CLUSTER_GAP_DAYS = 14  # a purchase this close to the previous one continues the same bout of buying
+
+
+def cluster_episodes(buys, gap_days=CLUSTER_GAP_DAYS, min_insiders=2) -> list:
+    """Split one company's purchases into separate bouts of buying, and keep the bouts with at
+    least `min_insiders` different buyers: [{first, last, insiders, total_value}], oldest first.
+
+    cluster_buys() treats a whole window as one group, which is right for "who is buying now"
+    but wrong over a year: two directors buying nine months apart are not a cluster."""
+    day = lambda b: dt.date.fromisoformat(b["trans_date"])
+    bouts, cur = [], []
+    for b in sorted((b for b in buys if b.get("trans_date")), key=lambda b: b["trans_date"]):
+        if cur and (day(b) - day(cur[-1])).days > gap_days:
+            bouts.append(cur)
+            cur = []
+        cur.append(b)
+    if cur:
+        bouts.append(cur)
+    out = []
+    for bout in bouts:
+        who = {b["owner_name"] for b in bout}
+        if len(who) >= min_insiders:
+            out.append({"first": bout[0]["trans_date"], "last": bout[-1]["trans_date"], "insiders": len(who),
+                        "total_value": sum(b.get("value") or 0 for b in bout)})
+    return out
+
+
 def large_buys(conn, since: str, min_value: float = config.LARGE_BUY_USD, limit: int = 30):
-    return _rows(conn, """
+    rows = _rows(conn, """
         SELECT DISTINCT trans_date, ticker, issuer_name, owner_name, relationship,
-               shares, price, value, shares_after, url
+               shares, price, value, shares_after, url, accession
         FROM insider_tx
         WHERE code='P' AND is_derivative=0 AND plan_10b5_1=0 AND value >= ?
           AND (is_officer=1 OR is_director=1) AND trans_date>=?
         ORDER BY value DESC LIMIT ?""", (min_value, since, limit))
+    stakes = {}
+    for r in rows:  # the whole filing's purchases against everything the filer reports holding
+        acc = r.pop("accession")
+        if acc not in stakes:
+            stakes[acc] = insider_stake(conn, _rows(conn, """
+                SELECT DISTINCT accession, filed_date, security, direct_indirect, trans_date, shares,
+                       shares_after FROM insider_tx
+                WHERE accession=? AND code='P' AND is_derivative=0""", (acc,)))
+        r["stake_change"] = stakes[acc]
+    return rows
 
 
 def exec_sales(conn, since: str, min_value: float = config.EXEC_SALE_USD, limit: int = 30):

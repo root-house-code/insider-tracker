@@ -45,6 +45,56 @@ A plain HTML UI over the same database.
   make a cluster, and the page re-queries. Every view exports CSV. Insider cluster buys
   also has date ranges for **first buy** and **last buy** (for example "last buy since
   Oct 1" = still active), separate from the window, which decides which purchases count.
+- **Insider cluster buys** columns:
+  - **roles:** who bought, most senior first (CEO, CFO, ..., Director, 10% owner), read from
+    each filer's free-text title. Filterable, so you can keep just the clusters a CEO joined.
+  - **max_stake_change:** the biggest growth in one buyer's holding ("new" if they held none
+    before), counting all their trusts and direct shares.
+  - **last_30d:** a sparkline of the last 30 days of closes, with the cluster's buying
+    days shaded and the change over the period, so you can see whether insiders bought
+    into a fall or chased a rise. Sorts by the change; Copy PNG includes it.
+  - **market_cap** and **avg_volume:** from Yahoo Finance, cached for a day and fetched in the
+    background the first time a ticker appears.
+  - **news:** click to expand. It lists Yahoo Finance headlines and the company's own SEC 8-K
+    filings (results, an executive change, a deal), from a month before the first buy. Items
+    from before the buying started are marked "before". The chart page lists the last two
+    months of news too.
+  - **news_tone:** negative, mixed, neutral or positive, with the average score and how many
+    headlines it rests on. It covers the headlines from the month before the first buy. Scored
+    by VADER with finance word weights, so "beats estimates" counts as good, while "cancer",
+    "crude" or "shares" count for nothing.
+- **Backtest: cluster buys** (a Signals view) - how every cluster has done since it became public.
+  - **Entry:** the next open after the filing that made it a cluster. Using trade dates would flatter
+    the results.
+  - **Returns:** after 5, 10, 20, 60 and 120 trading days and to date, against SPY and IWM.
+  - **Summaries:** a table by horizon (median, mean, how often it beat SPY), and one by company size
+    and number of insiders. Each figure says how many clusters it rests on and whether that's enough
+    to mean anything.
+
+  It recalculates every time you open it, and tops up stale prices in the background, so it stays
+  current as filings arrive. Clusters with no price history (often delisted) drop out and the page
+  says how many, since that flatters the results.
+- **Fund / insider overlap** (a Signals view) - stocks insiders bought that institutions were also net
+  buying, across *every* 13F filer rather than a chosen few. It has the cluster columns plus:
+  - how many funds opened, added to, cut or closed a position (moves of 5% or less count as held);
+  - net funds buying, total holders, and the change in shares held;
+  - what your Watchlist managers did.
+
+  The data comes from the SEC's quarterly Form 13F data sets: run **Funds** on the Jobs tab, or
+  `python -m insider_tracker funds`. That downloads the two newest data sets (about 200 MB, kept in
+  `data/13f_sets/`) and stores only a per-stock summary. Only managers who filed both quarters are
+  compared. 13F positions are quarter-end and published months later, so this shows what funds
+  were doing *before* the insiders bought.
+- **Tone** - tune that scoring:
+  - label real headlines good, neutral or bad, and see how often the scores agree with you,
+    with bad news counted on its own;
+  - edit the word weights, phrase rules and cut-offs, **Preview** the effect, then **Save**;
+  - each headline shows the words that drove its score, and a panel lists the most frequent
+    scored words so you can spot names VADER misreads.
+
+  Settings go in `tone.toml` and labels in `tone_labels.json`, both kept out of git.
+
+  Large purchases has the same **stake_change** for each filing.
 - **Raw tables** - `insider_tx`, `congress_tx`, `holdings_13f` and `processed`
   with per-column filters (plain text matches as a substring; `>1000000` or
   `=P` compare). These tables are wide, so the columns worth reading are shown

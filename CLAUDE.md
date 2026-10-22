@@ -119,6 +119,21 @@ SQLite file; output is a Markdown report + CSVs per section.
     `systemd-analyze calendar` (DEPLOY.md step 8). `deploy/run.sh` is always invoked through
     `sh` (a copy from Windows loses the exec bit), strips CRs from `.env`, and `.gitattributes`
     pins `deploy/**` to LF.
+- `funds.py` the Fund / insider overlap view's data: the SEC's quarterly Form 13F data sets (one zip per
+  three months of filing dates, so roughly one quarter; ~100 MB, INFOTABLE ~400 MB unzipped). Positions
+  are staged in a throwaway SQLite file and only the per-CUSIP summary (`fund_flows`) and watchlist
+  managers' rows (`fund_tracked`) are kept.
+  - **Comparison rules.** Only managers who filed both quarters are compared. The quarter is read from
+    the data, not the file name (zips also hold late filings for old periods). The latest
+    original-or-restatement filing is the position, and NEW HOLDINGS amendments add to it. SH only:
+    no PRN or options. A change of 5% or less counts as held.
+  - **Issuer names** are filer-typed, so the most common spelling per CUSIP is used ("QNITY
+    ELECTRONICS" was typed against H.B. Fuller's CUSIP).
+  - **Tickers.** The cusip_ticker cache first, then SEC-list name matching. Then
+    `fill_insider_tickers` takes stocks insiders bought that are still unmatched, compares their Form 4
+    name with 13F names, and confirms with OpenFIGI. It accepts an unconfirmed match only when
+    OpenFIGI knows nothing and exactly one CUSIP has that name. 72% of insider-bought tickers match;
+    the rest are mostly funds, fresh IPOs and OTC micro-caps.
 - `db.py` schema; `processed` table makes every source incremental (errors retry next run)
 - `cusip_map.py` 13F gives only CUSIPs. Two sources, labelled in `cusip_ticker.source`: OpenFIGI by
   CUSIP (`figi`; free, 25 req/min x 10, but its US coverage has holes -- real listed companies like

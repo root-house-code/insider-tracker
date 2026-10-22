@@ -26,6 +26,45 @@ CREATE TABLE IF NOT EXISTS insider_tx (
   url TEXT,
   PRIMARY KEY (accession, seq)
 );
+-- Form 4 Table I "holding" rows: stock a filer holds on lines with no transaction in that
+-- filing (another trust, shares held directly). The owner and issuer are the filing's, in insider_tx.
+CREATE TABLE IF NOT EXISTS insider_holdings (
+  accession TEXT NOT NULL, seq INTEGER NOT NULL,
+  security TEXT, shares REAL, direct_indirect TEXT, nature TEXT,
+  PRIMARY KEY (accession, seq)
+);
+-- Market cap and average daily volume per ticker string (Yahoo Finance), refreshed daily.
+CREATE TABLE IF NOT EXISTS quotes (
+  ticker TEXT PRIMARY KEY, symbol TEXT, market_cap REAL, avg_volume REAL,
+  status TEXT NOT NULL, note TEXT, fetched_at TEXT NOT NULL
+);
+-- Recent news per ticker string: Yahoo headlines and the company's SEC 8-K filings (news.py).
+-- Items accumulate (Yahoo only shows the last week or two); news_meta says when we last looked.
+CREATE TABLE IF NOT EXISTS news_items (
+  ticker TEXT NOT NULL, kind TEXT NOT NULL, published TEXT NOT NULL,
+  title TEXT, source TEXT, url TEXT NOT NULL,
+  PRIMARY KEY (ticker, kind, url)
+);
+CREATE TABLE IF NOT EXISTS news_meta (
+  ticker TEXT PRIMARY KEY, status TEXT NOT NULL, note TEXT, fetched_at TEXT NOT NULL
+);
+-- Every 13F filer's quarter-on-quarter changes, summarised per stock (funds.py), plus the
+-- positions of your watchlist managers. fund_meta records which quarters were compared.
+CREATE TABLE IF NOT EXISTS fund_flows (
+  period TEXT NOT NULL, prior_period TEXT, cusip TEXT NOT NULL, issuer TEXT, ticker TEXT,
+  holders INTEGER, new INTEGER, added INTEGER, cut INTEGER, exited INTEGER,
+  shares REAL, prior_shares REAL, value REAL,
+  PRIMARY KEY (period, cusip)
+);
+CREATE INDEX IF NOT EXISTS ix_fund_flows_ticker ON fund_flows(ticker);
+CREATE TABLE IF NOT EXISTS fund_tracked (
+  period TEXT NOT NULL, cik TEXT NOT NULL, manager TEXT, cusip TEXT NOT NULL,
+  shares REAL, prior_shares REAL, PRIMARY KEY (period, cik, cusip)
+);
+CREATE TABLE IF NOT EXISTS fund_meta (
+  period TEXT PRIMARY KEY, prior_period TEXT, managers INTEGER, managers_prior INTEGER,
+  compared INTEGER, loaded_at TEXT
+);
 CREATE INDEX IF NOT EXISTS ix_insider_date ON insider_tx(trans_date);
 CREATE INDEX IF NOT EXISTS ix_insider_ticker ON insider_tx(ticker);
 CREATE INDEX IF NOT EXISTS ix_insider_code ON insider_tx(code);

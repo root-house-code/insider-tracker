@@ -30,6 +30,7 @@ the webhook URL (a secret) is never written to logs or error messages.
 """
 import datetime as dt
 import logging
+import math
 import re
 import time
 import tomllib
@@ -37,6 +38,8 @@ from collections import defaultdict
 from pathlib import Path
 
 import requests
+
+from . import signals
 
 log = logging.getLogger(__name__)
 
@@ -182,7 +185,7 @@ def load_trades(conn, since: str, until: str, max_filing_value: float):
     rows = conn.execute(
         """SELECT ticker, issuer_name, issuer_cik, owner_name, owner_cik, relationship,
                   is_officer, is_director, is_ten_pct, trans_date, filed_date, shares, price,
-                  value, shares_after, accession, url, form_type
+                  value, shares_after, security, direct_indirect, accession, url, form_type
            FROM insider_tx
            WHERE code='P' AND is_derivative=0 AND plan_10b5_1=0 AND ticker<>''
              AND trans_date>=? AND filed_date<=?
@@ -219,7 +222,7 @@ def _role(t) -> str:
     return (t["relationship"] or "").strip() or "insider"
 
 
-def _insiders(trades) -> list:
+def _insiders(trades, conn=None) -> list:
     by = defaultdict(list)
     for t in trades:
         by[t["who"]].append(t)
@@ -231,7 +234,9 @@ def _insiders(trades) -> list:
         out.append({"who": who, "name": names[0] if names else who, "role": _role(ts[0]),
                     "shares": shares, "value": value, "avg_price": value / shares if shares else None,
                     "trades": ts, "first": min(t["trans_date"] for t in ts),
-                    "last": max(t["trans_date"] for t in ts)})
+                    "last": max(t["trans_date"] for t in ts),
+                    # growth of everything they hold, other trusts included when we have conn
+                    "stake": signals.insider_stake(conn, ts) if conn else signals.stake_change(ts)})
     return sorted(out, key=lambda i: -i["value"])
 
 
@@ -257,7 +262,7 @@ def evaluate(conn, cfg, today: dt.date, is_notified, last_posted=lambda rule, gr
             for t in pool:
                 by_issuer[t["issuer_cik"] or t["ticker"]].append(t)
             for issuer, ts in by_issuer.items():
-                ins = [i for i in _insiders(ts) if i["value"] >= rule["min_value_per_insider"]]
+                ins = [i for i in _insiders(ts, conn) if i["value"] >= rule["min_value_per_insider"]]
                 total = sum(i["value"] for i in ins)
                 if len(ins) < rule["min_insiders"] or total < rule["min_total_value"]:
                     continue
@@ -271,7 +276,7 @@ def evaluate(conn, cfg, today: dt.date, is_notified, last_posted=lambda rule, gr
                 if any(t[ROLES[r]] for r in rule["roles"]):
                     by_filing[(t["accession"], t["who"])].append(t)
             for ts in by_filing.values():
-                ins = _insiders(ts)
+                ins = _insiders(ts, conn)
                 total = sum(i["value"] for i in ins)
                 new = [t for t in ts if is_new(rule, t)]
                 if total >= rule["min_value"] and new:
@@ -320,12 +325,11 @@ def _dates(a, b) -> str:
 
 
 def _stake(i) -> str:
-    """How much the buy grew the holding, from the last trade's shares-owned-after."""
-    last = max(i["trades"], key=lambda t: (t["trans_date"], t["shares_after"] or 0))
-    before = (last["shares_after"] or 0) - i["shares"]
-    if not last["shares_after"] or before <= 0:
+    """How much the buys grew the insider's holding (signals.insider_stake)."""
+    pct = i.get("stake")
+    if pct is None:
         return ""
-    return f", +{i['shares'] / before:.0%} to holding"
+    return ", new position" if pct == math.inf else f", {signals.stake_text(pct)} to holding"
 
 
 def describe(alert) -> tuple:

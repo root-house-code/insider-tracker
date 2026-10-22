@@ -140,6 +140,31 @@ def ensure(conn, ticker: str, http=None, now=None) -> dict:
     return get_meta(conn, ticker)
 
 
+def stale(conn, tickers, now=None) -> list:
+    """Tickers whose cached prices are missing or past their freshness window (ensure() would fetch)."""
+    now = now or _now()
+    out = []
+    for t in dict.fromkeys(tickers):
+        meta = get_meta(conn, t)
+        limit = {"ok": FRESH_OK, "none": RETRY_NONE, "error": RETRY_ERROR}.get(meta["status"]) if meta else None
+        if not meta or limit is None or now - dt.datetime.fromisoformat(meta["fetched_at"]) >= limit:
+            out.append(t)
+    return out
+
+
+def refresh_in_background(db_path, tickers) -> bool:
+    """ensure() each ticker on a background thread, sharing one session. True if a fill is running now."""
+    from . import background
+    if not tickers:
+        return background.running("prices")
+
+    def fill(conn):
+        http = PoliteSession(UA, 0.4, max_retries=1, timeout=15)
+        for t in tickers:
+            ensure(conn, t, http)
+    return background.start_db("prices", db_path, fill)
+
+
 def safe_ensure(db_path, ticker, http=None) -> dict:
     """ensure() on its own connection, for callers whose own connection is read-only.
     Anything that goes wrong comes back as an 'error' status, never as an exception."""

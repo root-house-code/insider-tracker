@@ -8,3 +8,6 @@ __pycache__/
 alerts.toml
 # real third-party captures that can't be redistributed (see tests/fixtures/MANIFEST.json)
 tests/fixtures/local/
+# your headline-tone tuning (Tone tab)
+tone.toml
+tone_labels.json

@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 
-from . import alerts, config, db, edgar_13f, edgar_form4, house, report, senate, ui
+from . import alerts, config, db, edgar_13f, edgar_form4, funds, house, report, senate, ui
 from .edgar_common import tickers_to_ciks
 from .net import PoliteSession
 
@@ -51,6 +51,12 @@ def cmd_13f(args, conn):
         sys.exit("No 13F managers given. Use --managers CIK,CIK or add managers_13f to watchlist.json")
     n = edgar_13f.ingest(conn, _sec(), managers, quarters=args.quarters)
     print(f"13F: stored {n} positions for {len(managers)} managers")
+
+
+def cmd_funds(args, conn):
+    r = funds.ingest(conn, tracked=config.load_watchlist().get("managers_13f", {}))
+    print(f"Funds: 13F {r['period']} vs {r['prior']}, {r['compared']:,} institutions that filed both, "
+          f"{r['stocks']:,} stocks ({r['with_ticker'] + r.get('confirmed', 0):,} with a ticker)")
 
 
 def cmd_update(args, conn):
@@ -166,6 +172,9 @@ def main(argv=None):
     s.add_argument("--managers", help="comma-separated CIKs (overrides watchlist.json)")
     s.add_argument("--quarters", type=int, default=4)
     s.set_defaults(fn=cmd_13f)
+
+    s = sub.add_parser("funds", help="Load every 13F filer's latest quarter from the SEC's bulk data sets")
+    s.set_defaults(fn=cmd_funds)
 
     s = sub.add_parser("update", help="Daily incremental run of all sources + report")
     s.add_argument("--days", type=int, default=3)

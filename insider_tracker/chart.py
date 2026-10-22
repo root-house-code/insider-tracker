@@ -210,3 +210,33 @@ def build_svg(bars: list, buys: list, congress: list, bands: list, title: str = 
         x += 20 + 6.4 * len(text) + 26
     out.append("</svg>")
     return "".join(out)
+
+
+SPARK_W, SPARK_H, SPARK_PAD = 96, 22, 2
+
+
+def sparkline_svg(bars: list, band=None) -> str:
+    """A small monochrome line of closes for a table cell; '' with fewer than two bars. `band` is
+    (first, last) ISO dates to shade -- a cluster's buying window -- clipped to the bars shown."""
+    pts = [(b["date"], b["close"]) for b in bars if b.get("close") is not None]
+    if len(pts) < 2:
+        return ""
+    lo, hi = min(c for _, c in pts), max(c for _, c in pts)
+    span = (hi - lo) or 1.0
+    w, h, pad = SPARK_W, SPARK_H, SPARK_PAD
+    x = lambda i: pad + i * (w - 2 * pad) / (len(pts) - 1)
+    y = lambda c: h - pad - (c - lo) / span * (h - 2 * pad)
+    shade = ""
+    if band and band[0] and band[1]:
+        days = [d for d, _ in pts]
+        i0, i1 = bisect.bisect_left(days, band[0]), bisect.bisect_right(days, band[1]) - 1
+        if i0 <= i1 and i0 < len(days) and i1 >= 0:
+            left, right = x(max(i0, 0)) - 1.5, x(min(i1, len(days) - 1)) + 1.5
+            shade = (f'<rect x="{left:.1f}" y="0" width="{max(right - left, 3):.1f}" height="{h}" '
+                     f'fill="var(--rule)" opacity="0.6"/>')
+    line = " ".join(f"{x(i):.1f},{y(c):.1f}" for i, (_, c) in enumerate(pts))
+    ex, ey = x(len(pts) - 1), y(pts[-1][1])
+    return (f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}" role="img" '
+            f'aria-label="closing prices">{shade}'
+            f'<polyline points="{line}" fill="none" stroke="var(--fg)" stroke-width="1.2" '
+            f'stroke-linejoin="round"/><circle cx="{ex:.1f}" cy="{ey:.1f}" r="1.6" fill="var(--fg)"/></svg>')

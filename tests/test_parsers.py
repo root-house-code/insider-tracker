@@ -2,6 +2,7 @@
 Run: python -m pytest tests/  (or python tests/test_parsers.py)"""
 import datetime as dt
 import json
+import math
 import re
 import sqlite3
 import sys
@@ -15,7 +16,14 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from insider_tracker import alerts, chart, config, cusip_map, db, edgar_13f, edgar_form4, house, jobs, net, prices, profiles, report, senate, signals, ui  # noqa: E402
+from insider_tracker import alerts, chart, config, cusip_map, db, edgar_13f, edgar_form4, house, jobs, net, funds, news, prices, profiles, quotes, report, senate, signals, tone, ui  # noqa: E402
+
+# These tests are offline. Rendering the cluster table would otherwise start a real background
+# fetch from Yahoo and the SEC (and hold the temp database open while it runs).
+quotes.refresh_in_background = lambda db_path, tickers: False
+prices.refresh_in_background = lambda db_path, tickers: False
+news.refresh_in_background = lambda db_path, tickers: False
+news.safe_ensure = lambda db_path, ticker: None
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LDQUO, RDQUO = chr(0x201C), chr(0x201D)   # the curly quotes in UUU's footnote
@@ -1138,6 +1146,551 @@ def test_cluster_roles_from_free_text_titles():
         # one role picked from the dropdown keeps the clusters that include it
         page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "sf_roles": ["CEO"]})
         assert "1 of 2 rows" in page and "CEO &middot; CFO &middot; Director" in page
+
+
+def test_stake_change_counts_every_holding_once():
+    """Shares-owned-after is per holding line (direct, each trust). Growth must be measured against
+    everything the insider holds, or a top-up to a small trust looks like a doubled position."""
+    sc = signals.stake_change
+    t = lambda shares, after, di="D", day="2026-10-01", sec="Common Stock": {
+        "shares": shares, "shares_after": after, "direct_indirect": di, "trans_date": day, "security": sec}
+    assert sc([t(10_000, 50_000)]) == 25.0
+    assert sc([t(5_000, 45_000), t(5_000, 50_000, day="2026-10-02")]) == 25.0, "two buys, one holding"
+    # direct 40k -> 50k, and a fund 1,000 -> 2,000: 11,000 bought on 41,000 held
+    assert abs(sc([t(10_000, 50_000), t(1_000, 2_000, di="I")]) - 100 * 11_000 / 41_000) < 1e-9
+    # two different funds, both indirect: balances don't chain, so they're separate holdings
+    assert abs(sc([t(100, 1_100, di="I"), t(100, 900_100, di="I")]) - 100 * 200 / 901_000) < 1e-9
+    assert sc([t(1_000, 1_000)]) == math.inf, "held nothing before: a new position"
+    assert sc([t(1_000, 1_000)], [{"security": "Common Stock", "shares": 99_000}]) == 1_000 / 99_000 * 100, \
+        "a holding with no trade in the filing still counts"
+    assert sc([t(1_000, 1_000)], [{"security": "Class B Stock", "shares": 99_000}]) == math.inf, \
+        "another share class isn't the same position"
+    assert sc([t(5_000, 4_000)]) is None and sc([t(1_000, None)]) is None, "numbers that can't be right"
+    assert sc([t(1_000, 11_000), t(1_000, 11_000)]) == 10.0, "an amendment restating a line counts once"
+    assert [signals.stake_text(v) for v in (25.0, 0.42, math.inf, None)] == ["+25%", "+0.4%", "new", ""]
+
+    # the holding rows come from the filing itself: UUU's lists three entities and a direct holding
+    xml = edgar_form4.OWNERSHIP_RE.search(_fixture("form4_uuu_utf8.txt").decode("utf-8")).group(0)
+    held = edgar_form4.parse_holdings(xml, "u")
+    assert [(h["direct_indirect"], h["shares"]) for h in held] == [("I", 1133062.0), ("D", 10000.0),
+                                                                   ("I", 22700.0), ("I", 6200.0)]
+    assert held[0]["nature"] == "By Ault Lending, LLC"
+
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [
+            _trade("h1", who="Ann", cik="1", shares=1000, shares_after=1000, security="Common Stock",
+                   direct_indirect="I"),
+            _trade("h2", who="Bob", cik="2", shares=1000, shares_after=1000, security="Common Stock",
+                   direct_indirect="D", value=600_000)])
+        db.insert_rows(conn, "insider_holdings", [{"accession": "h1", "seq": 0, "security": "Common Stock",
+                                                   "shares": 9000.0, "direct_indirect": "D", "nature": None}])
+        conn.commit()
+        cb = signals.cluster_buys(conn, "2026-10-01")
+        assert cb[0]["max_stake_change"] == math.inf, "Bob held nothing; Ann's 9,000 direct shares count"
+        lb = {r["owner_name"]: r["stake_change"] for r in signals.large_buys(conn, "2026-10-01", 0)}
+        assert lb == {"Ann": 1000 / 9000 * 100, "Bob": math.inf}
+        page = ui.page_signals(conn, {"view": ["large_buys"], "days": ["3650"], "p_min_value": ["0"]})
+        assert ">+11%<" in page and ">new<" in page
+        assert b"new" in ui._csv_bytes(lb and [{"stake_change": math.inf}], ["stake_change"])
+        assert b"inf" not in ui._csv_bytes([{"stake_change": math.inf}], ["stake_change"])
+
+
+def _quote_doc(cap, vol, module="summaryDetail"):
+    """An invented quoteSummary answer, shaped like Yahoo's (values are {"raw", "fmt"} pairs)."""
+    vol_key = "averageVolume" if module == "summaryDetail" else "averageDailyVolume3Month"
+    return {"quoteSummary": {"result": [{module: {"marketCap": {"raw": cap, "fmt": "x"},
+                                                  vol_key: {"raw": vol, "fmt": "x"}}}], "error": None}}
+
+
+class _QuoteHttp:
+    """Yahoo's cookie, crumb and quoteSummary, answering per symbol: a payload, a status, or an exception."""
+    def __init__(self, plan, crumb="abc123"):
+        self.plan, self.crumb, self.calls = plan, crumb, []
+    def get(self, url, params=None, **kw):
+        self.calls.append((url, dict(params or {})))
+        if "fc.yahoo.com" in url:
+            return _Resp(404, None)
+        if "getcrumb" in url:
+            r = _Resp(200, None); r.text = self.crumb; return r
+        got = self.plan.get(url.rsplit("/", 1)[-1], 404)
+        if isinstance(got, Exception):
+            raise got
+        return _Resp(got, None) if isinstance(got, int) else _Resp(200, got)
+
+
+def test_quotes_market_cap_and_volume():
+    assert quotes.parse_quote(_quote_doc(2.5e9, 340_000)) == {"market_cap": 2.5e9, "avg_volume": 340_000}
+    assert quotes.parse_quote(_quote_doc(7e7, 9_000, module="price")) == {"market_cap": 7e7, "avg_volume": 9_000}
+    assert quotes.parse_quote({"quoteSummary": {"result": [{}]}}) is None
+
+    t0 = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)  # pages judge freshness by the real clock
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        h = _QuoteHttp({"HEI": 404, "HEI-A": _quote_doc(4e10, 466_000), "ACME": _quote_doc(2.5e9, 340_000),
+                        "DOWN": requests.ConnectionError("down")})
+        assert quotes.fetch_many(conn, ["ACME", "HEI, HEI.A", "GONE", "DOWN"], http=h, now=t0) == 2
+        assert sum("getcrumb" in u for u, _ in h.calls) == 1, "one handshake for the whole batch"
+        assert all(p.get("modules") == "summaryDetail,price" and p.get("crumb") == "abc123"
+                   for u, p in h.calls if "quoteSummary" in u)
+        got = quotes.get_many(conn, ["ACME", "HEI, HEI.A", "GONE", "DOWN"])
+        assert got["HEI, HEI.A"]["symbol"] == "HEI-A", "the first spelling Yahoo knows"
+        assert (got["GONE"]["status"], got["DOWN"]["status"]) == ("none", "error")
+        # fresh for a day; an unknown ticker for a week; a failure is retried in minutes
+        assert quotes.stale(conn, ["ACME", "GONE", "DOWN"], now=t0 + dt.timedelta(hours=1)) == ["DOWN"]
+        assert quotes.stale(conn, ["ACME", "GONE"], now=t0 + dt.timedelta(days=2)) == ["ACME"]
+        # no crumb: nothing fetched, everything marked as a retryable error, nothing raised
+        assert quotes.fetch_many(conn, ["ZZZ"], http=_QuoteHttp({}, crumb="<html>"), now=t0) == 0
+        assert quotes.get_many(conn, ["ZZZ"])["ZZZ"]["status"] == "error"
+
+        # the cluster table shows what is cached and fetches the rest in the background
+        db.insert_rows(conn, "insider_tx", [_trade("q1", who="Ann", cik="1"), _trade("q2", who="Bob", cik="2"),
+            _trade("q3", ticker="NEWCO", issuer_cik="5", who="Cy", cik="3"),
+            _trade("q4", ticker="NEWCO", issuer_cik="5", who="Di", cik="4")])
+        conn.commit()
+        started = []
+        saved = quotes.refresh_in_background
+        quotes.refresh_in_background = lambda path, tickers: started.append(list(tickers)) or True
+        try:
+            page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"]})
+        finally:
+            quotes.refresh_in_background = saved
+        assert ">$2.5B<" in page and ">340.0K<" in page
+        assert started == [["NEWCO"]] and "Fetching market cap and volume for 1 ticker" in page
+        assert 'title="' in page.split('>market_<wbr>cap<')[0].rsplit("<th", 1)[-1], "the heading explains itself"
+
+
+def _news_doc(*stories):
+    """An invented Yahoo search answer: (title, day, related tickers, link)."""
+    ts = lambda day: int(dt.datetime.fromisoformat(day + "T14:00:00+00:00").timestamp())
+    return {"news": [{"uuid": str(n), "title": t, "publisher": "Example Wire", "link": link,
+                      "providerPublishTime": ts(day), "type": "STORY", "relatedTickers": rel}
+                     for n, (t, day, rel, link) in enumerate(stories)]}
+
+
+def _filings_doc(cik, *filings):
+    """An invented SEC submissions answer: (form, filed, items, accession)."""
+    return {"cik": cik, "filings": {"recent": {
+        "form": [f[0] for f in filings], "filingDate": [f[1] for f in filings],
+        "items": [f[2] for f in filings], "accessionNumber": [f[3] for f in filings],
+        "primaryDocument": ["doc.htm"] * len(filings)}}}
+
+
+def test_news_headlines_and_8k_filings():
+    ok = "https://news.example/a"
+    heads = news.parse_yahoo(_news_doc(("ACME beats", "2026-10-14", ["ACME"], ok),
+                                       ("Unrelated story", "2026-10-14", ["ZZZ"], ok + "2"),
+                                       ("Untagged but returned for ACME", "2026-10-13", [], ok + "3"),
+                                       ("Sneaky", "2026-10-13", ["ACME"], "javascript:alert(1)")), "ACME")
+    assert [h["title"] for h in heads] == ["ACME beats", "Untagged but returned for ACME"], \
+        "other companies' stories and non-web links are dropped"
+    assert heads[0]["published"].startswith("2026-10-14") and heads[0]["kind"] == "headline"
+
+    eights = news.parse_8k(_filings_doc(777, ("8-K", "2026-10-02", "2.02,9.01", "0000000001-26-000001"),
+                                        ("10-Q", "2026-10-03", "", "0000000001-26-000002"),
+                                        ("8-K", "2026-10-05", "5.02", "0000000001-26-000003"),
+                                        ("8-K", "2025-01-05", "1.01", "0000000001-25-000009")), "2026-04-01")
+    assert [(e["published"], e["title"]) for e in eights] == [("2026-10-02", "8-K: results"),
+                                                              ("2026-10-05", "8-K: director or officer change")]
+    assert eights[0]["url"] == "https://www.sec.gov/Archives/edgar/data/777/000000000126000001/doc.htm"
+
+    class Http:
+        def __init__(self, body):
+            self.body, self.calls = body, []
+        def get(self, url, params=None, **kw):
+            self.calls.append((url, params))
+            if isinstance(self.body, Exception):
+                raise self.body
+            return _Resp(200, self.body)
+
+    t0 = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)  # pages judge freshness by the real clock
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [
+            _trade("n1", who="Ann", cik="1", day="2026-10-06", issuer_cik="777"),
+            _trade("n2", who="Bob", cik="2", day="2026-10-08", issuer_cik="777")])
+        conn.commit()
+        y = Http(_news_doc(("<b>ACME</b> soars", "2026-10-14", ["ACME"], ok),
+                           ("ACME misses estimates", "2026-10-01", ["ACME"], ok + "/old")))
+        sec = Http(_filings_doc(777, ("8-K", "2026-10-02", "2.02,9.01", "0000000001-26-000001")))
+        assert news.fetch_many(conn, ["ACME"], yahoo_http=y, sec_http=sec, now=t0) == 1
+        assert y.calls[0][1]["q"] == "ACME" and "CIK0000000777" in sec.calls[0][0]
+        # Yahoo only shows the latest stories, so what was seen before is kept
+        news.fetch_many(conn, ["ACME"], yahoo_http=Http({"news": []}), sec_http=sec, now=t0)
+        assert len(news.get(conn, "ACME")) == 3
+        assert news.stale(conn, ["ACME"], now=t0 + dt.timedelta(hours=1)) == []
+        assert news.stale(conn, ["ACME"], now=t0 + dt.timedelta(hours=7)) == ["ACME"]
+        # a source that is down is noted and retried soon; nothing raises
+        news.fetch_many(conn, ["DOWN"], yahoo_http=Http(requests.ConnectionError("down")), sec_http=sec, now=t0)
+        assert conn.execute("select status from news_meta where ticker='DOWN'").fetchone()[0] == "error"
+
+        page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"]})
+        cell = re.search(r"<details><summary>(.*?)</summary>(.*?)</details>", page, re.S)
+        assert cell and "3 items &middot; 2 before &middot; 1 8-K" in cell.group(1)
+        assert "&lt;b&gt;ACME&lt;/b&gt; soars" in cell.group(2) and "<b>ACME</b>" not in page, "titles are escaped"
+        assert cell.group(2).count('class="pre"') == 2, "the 8-K and the miss came before the first buy"
+        assert '<select name="sf_news"' not in page, "a fold-out list isn't a filter value"
+        chart_page = ui.page_chart(conn, {"ticker": ["ACME"]}, {"symbol": None, "status": "none", "note": "n"})
+        assert "Recent news" in chart_page and "ACME misses estimates" in chart_page
+
+
+def test_tone_scoring_reads_finance_headlines():
+    """Plain VADER calls 'beats estimates' neutral and a cancer-drug approval bad news; the finance
+    settings must fix those without needing anything beyond the defaults."""
+    s = tone.validate({})
+    score = lambda t: tone.score_text(t, s)
+    assert score("Acme beats estimates and raises guidance") > 0.4
+    assert score("Acme misses estimates, cuts guidance") < -0.4
+    assert score("Acme shares plummet after downgrade") < -0.4
+    assert tone.classify(score("Acme wins approval for its cancer drug"), s) == 1, "'cancer' isn't the news"
+    assert tone.classify(score("Acme to report third quarter results"), s) == 0
+    assert score("Acme receives Nasdaq notice on minimum bid price requirement") < -0.3
+    assert score("Acme is not expected to cut guidance") > score("Acme expected to cut guidance"), \
+        "phrases become single tokens, so VADER's negation still applies"
+    sc, why = tone.explain("Acme beats estimates as shares soar", s)
+    assert [n for n, _ in why] == ["beats estimates", "soar"], why
+    # 8-Ks: only filing types that are bad news by nature count
+    assert tone.score_item({"kind": "8k", "title": "8-K: past financials unreliable"}, s) == -0.8
+    assert tone.score_item({"kind": "8k", "title": "8-K: results"}, s) is None
+    label, avg, n = tone.summarize([{"kind": "headline", "title": "Acme misses estimates"},
+                                    {"kind": "headline", "title": "Acme shares plummet"},
+                                    {"kind": "8k", "title": "8-K: results"}], s)
+    assert (label, n) == ("negative", 2) and avg < -0.15
+    assert tone.summarize([{"kind": "8k", "title": "8-K: results"}], s) is None, "nothing to score: no tone"
+
+
+def test_tone_tab_tunes_settings_and_labels():
+    """Everything the Tone tab changes goes through tone.toml and tone_labels.json: settings round-trip,
+    mistakes are reported without saving, previews write nothing, and labels drive the agreement."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, lab = Path(tmp) / "tone.toml", Path(tmp) / "tone_labels.json"
+        saved = tone.CONFIG_PATH, tone.LABELS_PATH
+        tone.CONFIG_PATH, tone.LABELS_PATH = cfg, lab
+        try:
+            s = tone.load()
+            assert s == tone.validate({}) and not cfg.exists(), "no file: the built-in settings"
+            s["words"]["acmeish"] = 3.0
+            tone.save(s)
+            assert tone.load() == s, "what is saved is what is loaded"
+            form = lambda **kw: {k: [v] for k, v in {
+                "item_cut": "0.05", "label_at": "0.15", "mixed_at": "0.3", "lead_days": "30",
+                "words": tone.words_text(s), "phrases": tone.phrases_text(s), "bad_8k": tone.bad_8k_text(s),
+                **kw}.items()}
+            assert tone.from_form(form()) == s, "the form shows exactly what is saved"
+            for bad, msg in ((dict(words="soar = lots"), "words line 1"), (dict(words="soar = 9"), "between -4 and 4"),
+                             (dict(phrases="broken: (unclosed = 1"), "doesn't compile"),
+                             (dict(label_at="x"), "label_at must be a number")):
+                try:
+                    tone.from_form(form(**bad))
+                    raise AssertionError(f"accepted {bad}")
+                except tone.SettingsError as exc:
+                    assert msg in str(exc), (msg, str(exc))
+            cfg.write_text("not = [valid toml", encoding="utf-8")
+            try:
+                tone.load()
+                raise AssertionError("a broken tone.toml must say so")
+            except tone.SettingsError:
+                pass
+            tone.reset()
+            assert not cfg.exists()
+
+            tone.set_label("Acme misses estimates", -1)
+            tone.set_label("Acme to report results", 0)
+            tone.set_label("Acme shares jump", 1)
+            tone.set_label("Acme shares jump", None)
+            tone.set_label("Acme shares climb on upgrade", 1)
+            a = tone.agreement(tone.load_labels())
+            assert (a["labeled"], a["agree"], a["bad_caught"], a["good_caught"]) == (3, 3, 1, 1), a
+
+            with _tmpdb() as conn:
+                conn.row_factory = sqlite3.Row
+                db.insert_rows(conn, "insider_tx", [_trade("t1", who="Ann", cik="1", day="2026-10-10"),
+                                                    _trade("t2", who="Bob", cik="2", day="2026-10-12")])
+                conn.executemany("INSERT INTO news_items (ticker, kind, published, title, source, url) VALUES "
+                                 "('ACME', 'headline', ?, ?, 'Wire', ?)",
+                                 [("2026-10-01T14:00+00:00", "Acme misses estimates", "https://n.example/1"),
+                                  ("2026-10-03T14:00+00:00", "Acme shares plummet", "https://n.example/2"),
+                                  ("2026-10-14T14:00+00:00", "Acme shares soar", "https://n.example/3")])
+                conn.commit()
+                page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"]})
+                assert re.search(r">negative <span[^>]*>-0\.\d\d &middot; 2<", page), \
+                    "the two headlines before the first buy; the later 'soar' isn't counted"
+                assert "tone -0." in page, "each headline in the news list shows its score"
+                filtered = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"],
+                                                  "sf_news_tone": ["negative"]})
+                assert "1 of 1 rows" in filtered
+
+                tab = ui.page_tone(conn, {})
+                assert "agrees with you on 3/3" in tab and "Acme shares plummet" in tab and "plummet -2.8" in tab
+                assert ui.page_tone(conn, {"show": ["unlabeled"]}).count("<tr>") == 1 + 2, "header + 2 rows"
+                # a preview scores with the form's settings, says so, and writes nothing
+                weak = dict(tone.validate({}))
+                weak["words"] = {**weak["words"], "plummet": 0.0}
+                prev = ui.page_tone(conn, {}, preview=weak)
+                assert "This preview (not saved)" in prev and not cfg.exists()
+
+                # the real routes: save, a mistake, a label
+                srv = ui._Server(("127.0.0.1", 0), type("H", (ui._Handler,), {"db_path": str(conn.execute(
+                    "PRAGMA database_list").fetchone()[2])}))
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                base = f"http://127.0.0.1:{srv.server_port}"
+                try:
+                    r = requests.post(base + "/tone", data={k: v[0] for k, v in form(action="save").items()},
+                                      allow_redirects=False)
+                    assert r.status_code == 303 and cfg.exists()
+                    r = requests.post(base + "/tone", data={k: v[0] for k, v in form(action="save", words="x = y").items()})
+                    assert r.status_code == 200 and "Not saved" in r.text and "x = y" in r.text, "the typo is kept to fix"
+                    r = requests.post(base + "/tone/label", data={"title": "Acme shares soar", "label": "good",
+                                                                  "back": "show=labeled"}, allow_redirects=False)
+                    assert r.status_code == 303 and r.headers["Location"] == "/tone?show=labeled"
+                    assert tone.load_labels()["Acme shares soar"] == 1
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+        finally:
+            tone.CONFIG_PATH, tone.LABELS_PATH = saved
+
+
+def test_sparkline_column_shows_the_last_30_days():
+    day = lambda n: (dt.date.today() - dt.timedelta(days=n)).isoformat()
+    bars = [{"date": day(n), "close": c} for n, c in ((28, 50.0), (21, 45.0), (14, 40.0), (7, 44.0), (1, 55.0))]
+    svg = chart.sparkline_svg(bars, (day(15), day(13)))
+    assert svg.startswith('<svg class="spark"') and svg.count("<rect") == 1, "the buying window is shaded"
+    assert "var(--fg)" in svg and "#" not in svg, "theme colours, so dark mode follows"
+    assert chart.sparkline_svg(bars[:1]) == "" and "<rect" not in chart.sparkline_svg(bars, (day(90), day(80))), \
+        "one bar is no line; a window outside the 30 days isn't drawn"
+
+    t0 = dt.datetime.now(dt.timezone.utc)
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [_trade("s1", who="Ann", cik="1", day=day(14)),
+                                            _trade("s2", who="Bob", cik="2", day=day(13)),
+                                            _trade("s3", ticker="NOPX", issuer_cik="8", who="Cy", cik="3", day=day(14)),
+                                            _trade("s4", ticker="NOPX", issuer_cik="8", who="Di", cik="4", day=day(13))])
+        db.insert_rows(conn, "prices", [dict(b, symbol="ACME", open=None, high=None, low=None, adj_close=b["close"],
+                                             volume=None) for b in bars])
+        prices._set_meta(conn, "ACME", "ACME", "ok", None, t0)
+        conn.commit()
+        assert prices.stale(conn, ["ACME", "NOPX"], now=t0) == ["NOPX"]
+        assert prices.stale(conn, ["ACME"], now=t0 + dt.timedelta(hours=7)) == ["ACME"]
+        started = []
+        saved = prices.refresh_in_background
+        prices.refresh_in_background = lambda path, tickers: started.append(list(tickers)) or True
+        try:
+            page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "sort": ["last_30d"],
+                                          "dir": ["desc"]})
+        finally:
+            prices.refresh_in_background = saved
+        assert '<svg class="spark"' in page and ">+10.0%<" in page.replace("</svg>", ">"), "50 -> 55"
+        assert started == [["NOPX"]] and "Fetching prices for 1 ticker" in page
+        assert page.index('href="/chart?ticker=ACME"') < page.index('href="/chart?ticker=NOPX"'), \
+            "sorted by the change; no prices sinks to the bottom"
+        rows = signals.cluster_buys(conn, "2000-01-01")
+        ui._add_sparks(conn, rows)
+        csv_text = ui._csv_bytes(rows, ["ticker", "last_30d"]).decode()
+        assert "ACME,10.0" in csv_text.replace("10.000000000000009", "10.0"), csv_text
+
+    # the shared background runner: one thread per name, errors swallowed
+    from insider_tracker import background
+    ran, gate = [], threading.Event()
+    with tempfile.TemporaryDirectory() as tmp:
+        dbp = str(Path(tmp) / "b.db")
+        assert background.start_db("t-test", dbp, lambda c: (gate.wait(5), ran.append(1)))
+        assert background.start_db("t-test", dbp, lambda c: ran.append(2)), "already running: not started twice"
+        gate.set()
+        background._threads["t-test"].join(5)
+        assert ran == [1] and not background.running("t-test")
+        background.start_db("t-boom", dbp, lambda c: 1 / 0)
+        background._threads["t-boom"].join(5)
+
+
+def test_chart_draws_each_bout_of_buying_as_its_own_cluster():
+    """Over a year, purchases months apart are separate events: two bouts with 2+ buyers are two
+    bands, and a lone buyer in between is no band at all (it used to be one year-long 'cluster')."""
+    day = lambda n: (dt.date.today() - dt.timedelta(days=n)).isoformat()
+    buys = [("Ann", 300), ("Bob", 295), ("Cy", 200), ("Di", 40), ("Ed", 33), ("Ed", 31)]
+    eps = signals.cluster_episodes([{"trans_date": day(n), "owner_name": w, "value": 1000.0} for w, n in buys])
+    assert [(e["first"], e["last"], e["insiders"]) for e in eps] == [(day(300), day(295), 2), (day(40), day(31), 2)]
+    assert eps[1]["total_value"] == 3000.0
+    # a chain of purchases each within 14 days of the last is one bout, however long it runs
+    chain = [{"trans_date": day(n), "owner_name": w, "value": 1.0} for w, n in (("A", 60), ("B", 48), ("C", 36))]
+    assert len(signals.cluster_episodes(chain)) == 1
+
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [_trade(f"e{i}", who=w, cik=str(i), day=day(n))
+                                            for i, (w, n) in enumerate(buys)])
+        conn.commit()
+        meta = {"symbol": None, "status": "none", "note": "n"}
+        page = lambda rng: ui.page_chart(conn, {"ticker": ["ACME"], "range": [rng]}, meta)
+        assert "6 insider buy rows" in page("1y") and "2 cluster windows" in page("1y")
+        assert "1 cluster window " in page("3m"), "a shorter range shows only the bouts inside it"
+
+        # drawn: with prices, each bout is its own labelled band on the chart
+        bars = [{"symbol": "ACME", "date": day(n), "open": None, "high": None, "low": None, "close": 50.0 + n % 7,
+                 "adj_close": None, "volume": None} for n in range(1, 330)]
+        db.insert_rows(conn, "prices", bars)
+        conn.commit()
+        drawn = ui.page_chart(conn, {"ticker": ["ACME"], "range": ["1y"]},
+                              {"symbol": "ACME", "status": "ok", "note": None, "fetched_at": "x"})
+        assert drawn.count("Cluster: 2 insiders") == 2 and f"bought {day(300)} to {day(295)}" in drawn
+
+
+def test_status_shows_stored_data_sizes():
+    assert [ui._size(n) for n in (0, 999, 1536, 5 * 1024 ** 2, 3 * 1024 ** 3)] == \
+        ["0 bytes", "999 bytes", "1.5 KB", "5.0 MB", "3.0 GB"]
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [_trade(f"z{i}", who=f"P{i}", cik=str(i)) for i in range(50)])
+        conn.commit()
+        rows, total = ui._storage_rows(conn)
+        db_file = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        assert rows[0]["stored"] == db_file.name and total >= db_file.stat().st_size
+        tx = next(r for r in rows if r["stored"].strip() == "insider_tx")
+        assert tx["rows"] == 50 and tx["size"].startswith("about ") and "KB" in tx["size"]
+        assert rows.index(tx) == 1, "the biggest table first"
+        assert rows[-1]["stored"] == "TOTAL" and rows[-1]["size"] == ui._size(total)
+        assert rows[-1]["rows"] == sum(r["rows"] for r in rows[1:-1] if r["rows"] is not None)
+        page = ui.page_status(conn, {})
+        assert ">stored data<" in page and "in total" in page and "insider_tx" in page and "about " in page
+
+
+def _13f_zip(path, period, filings, rows):
+    """An invented SEC 13F data set: filings = (accession, cik, type, filed, amendment type, name),
+    rows = (accession, cusip, issuer, shares, kind, put/call)."""
+    import zipfile
+    tsv = lambda head, body: "\t".join(head) + "\n" + "".join("\t".join(map(str, r)) + "\n" for r in body)
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("SUBMISSION.tsv", tsv(["ACCESSION_NUMBER", "FILING_DATE", "SUBMISSIONTYPE", "CIK", "PERIODOFREPORT"],
+                                        [(a, f, t, cik, p or period) for a, cik, t, f, _, _, p in filings]))
+        z.writestr("COVERPAGE.tsv", tsv(["ACCESSION_NUMBER", "REPORTCALENDARORQUARTER", "ISAMENDMENT", "AMENDMENTNO",
+                                        "AMENDMENTTYPE", "FILINGMANAGER_NAME"],
+                                       [(a, p or period, "Y" if am else "", "", am, nm) for a, _, _, _, am, nm, p in filings]))
+        z.writestr("INFOTABLE.tsv", tsv(["ACCESSION_NUMBER", "INFOTABLE_SK", "NAMEOFISSUER", "TITLEOFCLASS", "CUSIP",
+                                        "FIGI", "VALUE", "SSHPRNAMT", "SSHPRNAMTTYPE", "PUTCALL"],
+                                       [(a, i, iss, "COM", cu, "", sh * 10, sh, kind, pc)
+                                        for i, (a, cu, iss, sh, kind, pc) in enumerate(rows)]))
+
+
+def test_funds_summarise_every_13f_filer():
+    with tempfile.TemporaryDirectory() as tmp:
+        q1, q2 = Path(tmp) / "01mar2026-31may2026_form13f.zip", Path(tmp) / "01jun2026-31aug2026_form13f.zip"
+        F = lambda a, cik, filed, t="13F-HR", am="", name="", period=None: (a, cik, t, filed, am, name or f"Fund {cik}", period)
+        _13f_zip(q1, "31-MAR-2026", [F("a1", "0000000001", "15-MAY-2026"), F("b1", "0000000002", "14-MAY-2026"),
+                                     F("c1", "0000000003", "10-MAY-2026"), F("d1", "0000000004", "12-MAY-2026"),
+                                     F("z1", "0000000009", "01-APR-2026", period="31-DEC-2001")],
+                 [("a1", "ACME00001", "ACME CORP", 1000, "SH", ""), ("b1", "ACME00001", "ACME CORP", 1000, "SH", ""),
+                  ("c1", "ACME00001", "ACME CORP", 1000, "SH", ""), ("d1", "ACME00001", "ACME CORP", 1000, "SH", ""),
+                  ("z1", "ACME00001", "ACME CORP", 999999, "SH", "")])
+        _13f_zip(q2, "30-JUN-2026", [
+            F("a2", "0000000001", "14-AUG-2026"),                           # +50%: added
+            F("b2", "0000000002", "13-AUG-2026"),                           # 1,020: within 5% -> held
+            F("c2", "0000000003", "10-AUG-2026"),                           # sold out, but...
+            F("c3", "0000000003", "20-AUG-2026", "13F-HR/A", "RESTATEMENT"),  # ...restated: 400 -> cut
+            F("d2", "0000000004", "12-AUG-2026"),                           # no ACME: exited
+            F("d3", "0000000004", "30-AUG-2026", "13F-HR/A", "NEW HOLDINGS"),  # adds NEWCO: new
+            F("e2", "0000000005", "01-AUG-2026"),                           # first filing: not compared
+            F("x2", "0000000006", "02-AUG-2026", "13F-NT")],
+            [("a2", "ACME00001", "ACME CORP", 1500, "SH", ""), ("a2", "ACME00001", "ACME CORP", 9000, "SH", "Call"),
+             ("b2", "ACME00001", "ACME CORP", 1020, "SH", ""), ("b2", "ACME00001", "ACME CORP", 50000, "PRN", ""),
+             ("c2", "ZZZZ00001", "OTHER INC", 10, "SH", ""), ("c3", "ACME00001", "ACME CORP", 400, "SH", ""),
+             ("d2", "ZZZZ00001", "OTHER INC", 10, "SH", ""), ("d3", "NEWC00001", "NEWCO INC", 500, "SH", ""),
+             ("e2", "ACME00001", "ACME CORP", 7777, "SH", ""), ("e2", "ACME00001", "ACME TYPO NAME", 1, "SH", "")])
+        assert funds.quarter_of(q2) == "2026-06-30" and funds.quarter_of(q1) == "2026-03-31"
+
+        class Sec:  # the SEC ticker list that names are matched against
+            def get(self, url, **kw):
+                return _Resp(200, {"0": {"ticker": "ACME", "title": "Acme Corp"}, "1": {"ticker": "NWC", "title": "Newco Inc"}})
+        with _tmpdb() as conn:
+            conn.row_factory = sqlite3.Row
+            r = funds.summarize(conn, q2, q1, tracked={"0000000001": "My fund"}, sec_http=Sec())
+            assert (r["period"], r["prior"], r["compared"]) == ("2026-06-30", "2026-03-31", 4), r
+            f = funds.flows_by_ticker(conn, "2026-06-30")
+            acme = f["ACME"]
+            assert (acme["holders"], acme["new"], acme["added"], acme["cut"], acme["exited"]) == (3, 0, 1, 1, 1), dict(acme)
+            assert (acme["shares"], acme["prior_shares"]) == (1500 + 1020 + 400, 4000), \
+                "options, bonds, a first-time filer and a 2001 filing are all left out"
+            assert acme["issuer"] == "ACME CORP" and f["NWC"]["new"] == 1
+            assert [(m, s, p) for m, s, p in funds.tracked_by_cusip(conn, "2026-06-30")["ACME00001"]] == \
+                [("My fund", 1500, 1000)]
+
+            # the tab: insiders bought ACME and NWC; institutions net bought only NWC (ACME: 1 added vs 2 cut/exited)
+            db.insert_rows(conn, "insider_tx", [_trade("o1", who="Ann", cik="1"),
+                                                _trade("o2", ticker="NWC", issuer_cik="5", who="Bo", cik="2")])
+            conn.commit()
+            rows = signals.fund_overlap(conn, "2026-01-01")
+            assert [x["ticker"] for x in rows] == ["NWC"] and rows[0]["net_funds"] == 1
+            assert rows[0]["fund_breadth"] is None, "one holder, none the quarter before: a new listing, not breadth"
+            # breadth on a stock with a real holder base: (new + added - cut - exited) / holders
+            conn.execute("UPDATE fund_flows SET holders=40, new=6, added=10, cut=3, exited=1 WHERE ticker='NWC'")
+            conn.commit()
+            assert signals.fund_overlap(conn, "2026-01-01")[0]["fund_breadth"] == 100 * 12 / 40
+            preset = ui.page_signals(conn, {"view": ["fund_overlap"], "days": ["3650"]})
+            assert ">Conviction screen<" in preset and "p_min_insiders=2" in preset and "sort=fund_breadth" in preset
+            assert ">+30.0%<" in preset, "breadth is shown as a percentage"
+            assert [x["ticker"] for x in signals.fund_overlap(conn, "2026-01-01", min_net_funds=-5)] == ["ACME", "NWC"]
+            acme_row = signals.fund_overlap(conn, "2026-01-01", min_net_funds=-5)[0]
+            assert acme_row["tracked_funds"] == "My fund +50%" and round(acme_row["fund_shares_change"], 1) == -27.0
+            page = ui.page_signals(conn, {"view": ["fund_overlap"], "days": ["3650"]})
+            assert "13F positions on <strong>2026-06-30</strong> against 2026-03-31, across 4 institutions" in page
+            assert ">news_<wbr>tone<" in page and ">news<" not in page, "the tone, without the news list"
+            conn.execute("INSERT INTO news_items (ticker, kind, published, title, source, url) VALUES "
+                         "('NWC', 'headline', '2026-10-10T14:00+00:00', 'Newco shares plummet', 'W', 'https://n.example/x')")
+            conn.commit()
+            assert re.search(r">negative <span", ui.page_signals(conn, {"view": ["fund_overlap"], "days": ["3650"]})), \
+                "news_tone is still worked out though the news column is gone"
+            assert 'href="/chart?ticker=NWC"' in page and 'href="/chart?ticker=ACME"' not in page
+
+        with _tmpdb() as conn:
+            assert "No 13F data loaded yet" in ui.page_signals(conn, {"view": ["fund_overlap"]})
+
+    page = '<a href="/files/x/data/form-13f-data-sets/01jun2026-31aug2026_form13f.zip">' \
+           '<a href="/files/y/01mar2026-31may2026_form13f.zip"><a href="/files/y/2023q4_form13f.zip">'
+    sets = funds.list_datasets(type("H", (), {"get": lambda self, url: type("R", (), {"text": page,
+                                                                                    "raise_for_status": lambda s: None})()})())
+    assert [(s[1], s[2]) for s in sets] == [("2026-06-01", "2026-08-31"), ("2026-03-01", "2026-05-31")]
+    assert "funds" in jobs.SOURCES
+
+
+def test_backtest_replays_clusters_from_when_they_were_public():
+    from insider_tracker import backtest
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [
+            # Ann buys on the 1st (filed the 2nd); Bob buys on the 3rd but files late, on the 6th:
+            # the cluster only became public on the 6th, so entry is the 7th's open, not the 4th's
+            _trade("k1", who="Ann", cik="1", day="2026-10-01", filed="2026-10-02"),
+            _trade("k2", who="Bob", cik="2", day="2026-10-03", filed="2026-10-06"),
+            # a lone buyer is no cluster
+            _trade("k3", ticker="SOLO", issuer_cik="8", who="Cy", cik="3", day="2026-10-01", filed="2026-10-02"),
+            # two buyers 20 days apart are two bouts, neither a cluster
+            _trade("k4", ticker="GAP", issuer_cik="9", who="Di", cik="4", day="2026-10-01", filed="2026-10-02"),
+            _trade("k5", ticker="GAP", issuer_cik="9", who="Ed", cik="5", day="2026-10-21", filed="2026-10-22")])
+        days = [f"2026-10-{d:02d}" for d in (5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 19, 20)]
+        price = {"ACME": [100, 100, 50, 51, 52, 53, 54, 55, 56, 57, 58, 60],   # entry at the 7th's open (50)
+                 "SPY": [10] * 12, "IWM": [20] * 11 + [22]}
+        for sym, closes in price.items():
+            db.insert_rows(conn, "prices", [{"symbol": sym, "date": d, "open": c, "high": c, "low": c, "close": c,
+                                             "adj_close": c, "volume": 1} for d, c in zip(days, closes)])
+            prices._set_meta(conn, sym, sym, "ok", None, dt.datetime.now(dt.timezone.utc))
+        conn.commit()
+        rows = backtest.events(conn, today="2026-10-20")
+        assert [r["ticker"] for r in rows] == ["ACME"], "a lone buyer and a 20-day gap aren't clusters"
+        r = rows[0]
+        assert (r["known_on"], r["entry_date"], r["insiders"]) == ("2026-10-06", "2026-10-07", 2)
+        assert abs(r["ret_5d"] - 100 * (54 / 50 - 1)) < 1e-9, "5 trading days: the close of the 13th"
+        assert abs(r["ret_to_date"] - 20.0) < 1e-9 and r["days_held"] == 10 and "ret_20d" not in r
+        assert abs(r["vs_spy"] - 20.0) < 1e-9 and abs(r["vs_iwm"] - 10.0) < 1e-9, "IWM rose 10% over the same days"
+
+        s = {x["horizon"]: x for x in backtest.summary(rows)}
+        assert s["5 trading days"]["events"] == 1 and s["20 trading days"]["events"] == 0
+        assert s["5 trading days"]["reliability"].startswith("too few") and s["20 trading days"]["reliability"] == "none yet"
+        assert backtest.signals_for([{"trans_date": "2026-10-01", "filed_date": "2026-10-02", "accession": "a",
+                                      "who": "1", "value": 1}], 2) == []
+
+        page = ui.page_signals(conn, {"view": ["backtest"]})
+        assert "Clusters since 2026-10-02" in page and ">+20.0%<" in page and "too few to read" in page
+        assert ">2 insiders<" in page, "the by-kind table"
 
 
 def test_ui_sorting():

@@ -11,12 +11,12 @@ import datetime as dt
 import logging
 import threading
 
-from . import config, db, edgar_13f, edgar_form4, house, report, senate
+from . import config, db, edgar_13f, edgar_form4, funds, house, report, senate
 from .edgar_common import tickers_to_ciks
 from .net import PoliteSession
 
 log = logging.getLogger(__name__)
-SOURCES = ("form4", "house", "senate", "13f", "update")
+SOURCES = ("form4", "house", "senate", "13f", "funds", "update")
 
 _lock = threading.Lock()
 _jobs = {}  # source -> {status, started_at, finished_at, message, error}
@@ -149,6 +149,12 @@ def _run_13f(conn, params: dict) -> str:
     return f"stored {n} positions for {len(managers)} managers"
 
 
+def _run_funds(conn, params: dict) -> str:
+    r = funds.ingest(conn, tracked=config.load_watchlist().get("managers_13f", {}))
+    return (f"13F {r['period']} vs {r['prior']}: {r['compared']:,} institutions, {r['stocks']:,} stocks "
+            f"({r['with_ticker'] + r.get('confirmed', 0):,} with a ticker)")
+
+
 def _run_update(conn, params: dict) -> str:
     # Form 4 runs unfiltered: Update is the "refresh everything" button, so it
     # shouldn't silently depend on a watchlist (which may well be empty).
@@ -177,4 +183,4 @@ def _run_update(conn, params: dict) -> str:
 
 
 _RUNNERS = {"form4": _run_form4, "house": _run_house, "senate": _run_senate,
-            "13f": _run_13f, "update": _run_update}
+            "13f": _run_13f, "funds": _run_funds, "update": _run_update}

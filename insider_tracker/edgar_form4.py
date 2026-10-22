@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 FORMS = {"4", "4/A"}
 OWNERSHIP_RE = re.compile(r"<ownershipDocument>.*?</ownershipDocument>", re.S)
 PLAN_RE = re.compile(r"10b5-?1", re.I)
+HOLDINGS_LOOKBACK_DAYS = 90  # each ingest fills in holding rows for purchase filings this far back
 
 
 def daily_index_url(day: dt.date) -> str:
@@ -135,6 +136,46 @@ def parse_form4(xml_text: str, accession: str, form_type: str, filed_date: str) 
     return rows
 
 
+def parse_holdings(xml_text: str, accession: str) -> list:
+    """Table I "holding" rows: stock the owner reports holding, on a line that had no transaction
+    in this filing (a trust, a spouse's account, shares held directly while buying via a fund).
+    Without them, a purchase into one holding looks like the owner's whole position."""
+    root = strip_ns(ET.fromstring(xml_text))
+    return [{"accession": accession, "seq": seq, "security": _val(h, "securityTitle"),
+             "shares": to_num(_val(h, "postTransactionAmounts/sharesOwnedFollowingTransaction")),
+             "direct_indirect": _val(h, "ownershipNature/directOrIndirectOwnership"),
+             "nature": _val(h, "ownershipNature/natureOfOwnership")}
+            for seq, h in enumerate(root.findall("nonDerivativeTable/nonDerivativeHolding"))]
+
+
+def backfill_holdings(conn, http, since: str) -> int:
+    """Fetch holding rows for purchase filings stored before parse_holdings existed (or whose
+    fetch failed). Only filings with open-market purchases need them; returns how many were done."""
+    done = db.processed_ids(conn, "form4_holdings")
+    todo = [r[0] for r in conn.execute(
+        "SELECT DISTINCT accession FROM insider_tx WHERE code='P' AND is_derivative=0 AND filed_date>=?",
+        (since,)) if r[0] not in done]
+    paths = {}
+    for r in conn.execute("SELECT DISTINCT accession, url FROM insider_tx WHERE code='P' AND filed_date>=?", (since,)):
+        # .../edgar/data/<cik>/<acc no dashes>/<acc>-index.htm -> edgar/data/<cik>/<acc>.txt
+        parts = r[1].split("/edgar/data/", 1)[-1].split("/")
+        paths[r[0]] = f"edgar/data/{parts[0]}/{r[0]}.txt"
+    for i, acc in enumerate(todo, 1):
+        try:
+            xml_text = fetch_ownership_xml(http, paths[acc])
+            if xml_text:
+                db.insert_rows(conn, "insider_holdings", parse_holdings(xml_text, acc))
+            db.mark(conn, "form4_holdings", acc, "ok")
+        except Exception as exc:  # retried next time
+            log.warning("form4 holdings %s failed: %s", acc, exc)
+            db.mark(conn, "form4_holdings", acc, "error", str(exc)[:500])
+        if i % 100 == 0:
+            conn.commit()
+            log.info("  holdings %d/%d", i, len(todo))
+    conn.commit()
+    return len(todo)
+
+
 # ---------- runner ----------
 
 def ingest(conn, http, start: dt.date, end: dt.date, issuer_ciks: set = None) -> int:
@@ -161,7 +202,9 @@ def ingest(conn, http, start: dt.date, end: dt.date, issuer_ciks: set = None) ->
                     continue
                 rows = parse_form4(xml_text, f["accession"], f["form_type"], f["filed_date"])
                 stored += db.insert_rows(conn, "insider_tx", rows)
+                db.insert_rows(conn, "insider_holdings", parse_holdings(xml_text, f["accession"]))
                 db.mark(conn, "form4", f["accession"], "ok" if rows else "no_transactions")
+                db.mark(conn, "form4_holdings", f["accession"], "ok")
             except Exception as exc:  # keep going; failures are retried next run
                 log.warning("form4 %s failed: %s", f["accession"], exc)
                 db.mark(conn, "form4", f["accession"], "error", str(exc)[:500])
@@ -169,4 +212,6 @@ def ingest(conn, http, start: dt.date, end: dt.date, issuer_ciks: set = None) ->
                 conn.commit()
                 log.info("  %d/%d", i, len(filings))
         conn.commit()
+    # purchase filings stored before holdings were parsed: the stake-change math needs them
+    backfill_holdings(conn, http, (start - dt.timedelta(days=HOLDINGS_LOOKBACK_DAYS)).isoformat())
     return stored

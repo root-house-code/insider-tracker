@@ -34,7 +34,7 @@ from collections import namedtuple
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import chart, config, db, jobs, prices, profiles, signals
+from . import backtest, chart, config, db, funds, jobs, news, prices, profiles, quotes, signals, tone
 from .edgar_common import tickers_to_ciks
 from .net import PoliteSession
 
@@ -58,7 +58,7 @@ def _v(key, title, fn, params, cols, note="", tip="", takes_since=True, date_fil
 # consistent between a tab, its controls and its columns.
 
 NAV_TABS = [("signals", "Signals"), ("raw", "Raw tables"), ("sql", "SQL"),
-            ("watchlist", "Watchlist"), ("jobs", "Jobs"),
+            ("watchlist", "Watchlist"), ("tone", "Tone"), ("jobs", "Jobs"),
             ("status", "Status"), ("architecture", "Architecture")]
 
 # Every other tab in this app only reads the database -- every connection they
@@ -76,6 +76,10 @@ NAV_HELP = {
            "when you want to know what is actually in the database.",
     "sql": "Read-only SQL console for questions the other tabs can't express. Results are capped "
            "at 1,000 rows and 5 seconds. Nothing here can modify the database.",
+    "tone": "Tune how news headlines are scored good or bad (the news_tone column). Label real "
+            "headlines yourself, adjust the word weights and phrase rules, and see how often the "
+            "scores agree with you before saving. Writes tone.toml and tone_labels.json, never the "
+            "database.",
     "watchlist": "Which tickers Form 4 filters to, and which institutional managers 13F tracks, "
                 "when you don't run them unfiltered. Saved to watchlist.json. The only tab that "
                 "writes anything other than the database.",
@@ -246,6 +250,83 @@ COLUMN_HELP = {
     "value": "shares x price, in dollars. Blank whenever price is blank, so a blank here means "
              "unknown, not zero.",
     "total_value": "Combined dollar value of this cluster's purchases.",
+    "stake_change": "How much this purchase grew the holding it went into: shares bought divided by "
+                    "the shares held just before (shares_after minus shares). 'new' means they held "
+                    "none before -- the strongest form of conviction. Sort by it to rank purchases by "
+                    "commitment rather than dollar size. Blank when the filing's numbers don't add up.",
+    "stored": "A file this app keeps, or (indented) a table inside the database file.",
+    "rows": "How many rows the table holds.",
+    "size": "Files: exact size on disk. Tables: an estimate -- the stored values added up, without "
+            "indexes or SQLite's own overhead -- so tables won't add up to the database file.",
+    "what": "What it holds.",
+    "news_tone": "The tone of the headlines from the month before the first buy, scored by VADER "
+                 "with finance-specific word weights: negative, mixed, neutral or positive, then the "
+                 "average score (-1 to +1) and how many headlines it rests on. Insiders buying after "
+                 "negative news is the more telling case. A handful of headlines is a rough guide, "
+                 "not a verdict -- check the news column. Tune the scoring on the Tone tab.",
+    "news": "Recent news for the company: Yahoo Finance headlines and its own SEC 8-K filings "
+            "(earnings, an executive change, a deal). Click to expand. Items before the first buy are "
+            "marked -- insiders buying right after bad news is a stronger signal than buying into "
+            "good news. Sorts by the latest item's date.",
+    "last_30d": "Daily closes over the last 30 days, with the cluster's buying window shaded, and the "
+                "change over the period. Did insiders buy into a fall, or chase a rise? Sorts by the "
+                "change. Prices come from Yahoo Finance and are fetched in the background the first "
+                "time a ticker appears; click the ticker for the full chart.",
+    "known_on": "The filing date of the purchase that made this a cluster (brought in the last insider "
+                "needed): the first day anyone could have known. Trade dates come earlier and would flatter "
+                "the results.",
+    "entry_date": "The next trading day after known_on. Returns are measured from that day's open.",
+    "ret_5d": "Return from the entry open to the close 5 trading days later (about a week).",
+    "ret_10d": "Return to the close 10 trading days after entry (about two weeks).",
+    "ret_20d": "Return to the close 20 trading days after entry (about a month).",
+    "ret_60d": "Return to the close 60 trading days after entry (about three months).",
+    "ret_120d": "Return to the close 120 trading days after entry (about six months).",
+    "ret_to_date": "Return from the entry open to the latest close.",
+    "vs_spy": "ret_to_date minus SPY's return over the same days: above zero, it beat the S&P 500.",
+    "vs_iwm": "ret_to_date minus IWM's return over the same days: the fairer yardstick for small "
+              "companies, which most clusters are.",
+    "days_held": "Trading days from entry to the latest close.",
+    "status": "open: has returns. no prices yet: Yahoo has no history for it (often delisted, which "
+              "leaves the results looking better than they were). awaiting entry: too recent to have "
+              "traded since.",
+    "horizon": "How long after entry the return is measured.",
+    "events": "How many clusters this figure rests on.",
+    "median_return": "The middle return: half did better, half worse. Steadier than the mean.",
+    "mean_return": "The average return. One huge winner or loser can move it a lot.",
+    "beat_spy": "Share of clusters that beat SPY over the same days.",
+    "median_vs_spy": "The middle cluster's return minus SPY's over the same days.",
+    "median_vs_iwm": "The middle cluster's return minus IWM's (small caps) over the same days.",
+    "reliability": "Whether the number of clusters is enough to tell a real effect from luck. A few "
+                   "weeks of overlapping events from one market is a small sample whatever the count.",
+    "group": "A slice of the clusters, to see which kinds have done better.",
+    "net_funds": "Institutions that opened or added to a position, minus those that cut or closed one, "
+                 "in the latest 13F quarter -- among every manager that filed both quarters. Above zero: "
+                 "institutions were net accumulating.",
+    "fund_breadth": "Net funds as a share of all holders: (opened + added - cut - closed) / holders. "
+                    "Size-neutral, unlike net_funds, which favours mega-caps simply because they have "
+                    "thousands of holders churning. High breadth on a smaller stock means it was being "
+                    "discovered. Sort by it to compare companies of different sizes. Blank when the stock had "
+                    "fewer than 10 holders the quarter before or has fewer than 20 now: usually a fresh "
+                    "listing (every holder is 'new'), or too few to mean anything.",
+    "funds_new": "13F managers that held none of this stock the quarter before and some now.",
+    "funds_added": "Managers that grew an existing position by more than 5% (smaller moves are index "
+                   "rebalancing noise and count as held).",
+    "funds_cut": "Managers that shrank a position by more than 5%.",
+    "funds_exited": "Managers that held this stock the quarter before and none now.",
+    "fund_holders": "How many 13F managers held this stock at the end of the latest quarter.",
+    "fund_shares_change": "Change in the total shares those managers held, quarter on quarter.",
+    "tracked_funds": "Your Watchlist managers holding this stock, and what each did with it: +12%, new, "
+                     "exited, held. Add managers on the Watchlist tab; they are picked up the next time "
+                     "Funds runs on the Jobs tab.",
+    "market_cap": "The company's stock market value (Yahoo Finance, refreshed daily). Weigh the buying "
+                  "against it: $500k is a rounding error at a $50B company and a statement at a $50M one.",
+    "avg_volume": "Average shares traded per day over the last three months (Yahoo Finance). Low volume "
+                  "means a thinly traded stock, where insider buying can move the price by itself and "
+                  "where getting in or out at a fair price is harder.",
+    "max_stake_change": "The biggest stake change among this cluster's buyers: how much one insider's "
+                        "purchases in the window grew their holding ('new' = held none before). "
+                        "Separate holdings -- shares held directly and each trust or fund -- are "
+                        "tracked apart and added up, so a small top-up to one trust can't look huge.",
     "shares_after": "Shares the owner held immediately after the transaction. Compare against "
                     "shares to see how large a bite the trade took out of their position.",
     "amount_text": "The disclosure range exactly as Congress reported it. Members disclose bands, "
@@ -288,20 +369,51 @@ VIEWS = [
        [Param("min_insiders", "min insiders", 2, int,
               "How many different insiders must buy before a company shows up. Two is the "
               "usual bar. Raise it to 3 or more to cut the list down to the strongest cases.")],
-       ["ticker", "issuer_name", "insiders", "roles", "total_value", "first_buy", "last_buy", "who"],
+       ["ticker", "issuer_name", "last_30d", "insiders", "roles", "max_stake_change", "total_value",
+        "market_cap", "avg_volume", "first_buy", "last_buy", "news", "news_tone", "who"],
        "Two or more insiders at one company buying on the open market (code P), "
        "outside 10b5-1 plans. The strongest signal here.",
        "Several insiders at the same company buying on the open market at the same time. The "
        "strongest signal in this tool: insiders sell for many reasons but buy for essentially "
        "one. Start here.",
        date_filters=("first_buy", "last_buy")),
+    _v("fund_overlap", "Fund / insider overlap", signals.fund_overlap,
+       [Param("min_insiders", "min insiders", 1, int,
+              "How many different insiders must have bought in the window. 1 shows every stock an "
+              "insider bought; 2 or more keeps only clusters."),
+        Param("min_net_funds", "min net funds", 1, int,
+              "How many more institutions must have opened or added to a position than cut or closed "
+              "one, in the latest 13F quarter. Raise it to keep only stocks institutions were clearly "
+              "accumulating.")],
+       ["ticker", "issuer_name", "last_30d", "insiders", "roles", "max_stake_change", "total_value",
+        "net_funds", "fund_breadth", "funds_new", "funds_added", "funds_cut", "funds_exited", "fund_holders",
+        "fund_shares_change", "tracked_funds", "market_cap", "avg_volume", "first_buy", "last_buy",
+        "news_tone"],  # no "who" (a 30-name list made rows tall) or "news": both are on Insider cluster buys
+       "Stocks insiders bought on the open market (code P, outside 10b5-1 plans) that institutions "
+       "were also net buying in the latest 13F quarter, across every 13F filer.",
+       "Insider buying that institutions were also accumulating: more 13F managers opened or added "
+       "to a position than cut or closed one. 13F data is quarterly and lags by months, so read it as "
+       "what funds were doing before the insiders bought, not alongside them.",
+       date_filters=("first_buy", "last_buy")),
+    _v("backtest", "Backtest: cluster buys", lambda conn, min_insiders=2: backtest.events(conn, min_insiders),
+       [Param("min_insiders", "min insiders", 2, int,
+              "How many different insiders make a cluster. A cluster is dated by the filing that "
+              "brought in the last of them -- the first day anyone could have acted on it.")],
+       ["ticker", "issuer_name", "known_on", "entry_date", "insiders", "total_value", "ret_5d", "ret_10d",
+        "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm", "days_held", "market_cap",
+        "status"],
+       "Every insider cluster buy in the database, replayed as if you had bought at the next open after "
+       "it became public, with its returns since -- against SPY and IWM. Recomputed each time you open it.",
+       "How the cluster-buy signal has actually done since each cluster became public. Read the summary "
+       "first: it says how many clusters each figure rests on and whether that is enough to mean anything.",
+       takes_since=False, date_filters=("known_on",)),
     _v("large_buys", "Large officer / director purchases", signals.large_buys,
        [Param("min_value", "min $", config.LARGE_BUY_USD, float,
               "Smallest purchase to include, in dollars. Lower it to see more; raise it to keep "
               "only purchases big enough to matter to the buyer personally."),
         Param("limit", "rows", 30, int, "Maximum rows to return, largest first.")],
        ["trans_date", "ticker", "issuer_name", "owner_name", "relationship",
-        "shares", "price", "value", "shares_after", "url"],
+        "shares", "price", "value", "shares_after", "stake_change", "url"],
        "Open-market buys by an officer or director above the dollar threshold.",
        "Single large open-market purchases by an officer or director. Use it when no cluster has "
        "formed but one executive has put real money in. Compare value against shares_after to "
@@ -394,6 +506,12 @@ MODULES = [
                        ".txt -> ownershipDocument XML -> insider_tx."),
     ("edgar_13f.py", "13F (institutional holdings). data.sec.gov submissions API -> "
                      "index.json -> info table XML -> holdings_13f."),
+    ("backtest.py", "Replays every insider cluster buy from the day it became public (its filing date) "
+                    "and measures the returns since against SPY and IWM. Recomputed on every view, so "
+                    "it stays current as filings and prices arrive."),
+    ("funds.py", "Every 13F filer at once, from the SEC's quarterly Form 13F data sets: how many "
+                 "institutions opened, added to, cut or closed each stock, quarter on quarter. Stores "
+                 "a per-stock summary (fund_flows), not the millions of positions behind it."),
     ("cusip_map.py", "Maps 13F CUSIPs to tickers via OpenFIGI (the one third-party lookup), "
                     "cached forever in the cusip_ticker table so each CUSIP is asked about once."),
     ("house.py", "House PTRs. Clerk's yearly {year}FD.zip index -> one PDF per filing -> "
@@ -415,6 +533,17 @@ MODULES = [
     ("prices.py", "Daily prices for the chart page: fetched from Yahoo Finance the first time a "
                  "ticker's chart is opened, then cached and topped up. Failures (unknown symbol, "
                  "source unreachable) are remembered so a bad ticker isn't re-fetched on every click."),
+    ("news.py", "Recent news per ticker: Yahoo Finance headlines and the company's SEC 8-K filings, "
+                "for the Insider cluster buys tab and the chart page. Headlines are kept as they arrive, "
+                "since Yahoo only shows the last week or two; refreshed every six hours."),
+    ("tone.py", "Scores headlines from negative to positive with VADER plus finance word weights and "
+                "phrase rules, for the news_tone column. Every weight is tunable on the Tone tab, which "
+                "measures agreement with your own labels; settings in tone.toml, labels in tone_labels.json."),
+    ("quotes.py", "Market cap and average daily volume for the Insider cluster buys tab, from Yahoo "
+                  "Finance, cached for a day. Fetched on a background thread the first time a ticker "
+                  "appears, so the page never waits on Yahoo; failures leave the cells blank."),
+    ("background.py", "One background thread per cache fill (prices, quotes, news), so a "
+                       "page shows what is cached at once and the rest fills in while you read."),
     ("chart.py", "Draws the price chart as monochrome inline SVG, with insider buys, congressional "
                 "trades and cluster windows marked by shape. Pure functions; no I/O."),
     ("jobs.py", "In-memory job runner behind the Jobs tab: starts an ingest on a "
@@ -450,13 +579,18 @@ CODES = {
 }
 TX_TYPES = {"P": "buy", "S": "sell", "E": "exchange"}
 # Columns holding a GROUP_CONCAT list rather than a single value.
-LIST_COLS = {"who", "member_names", "roles"}
+LIST_COLS = {"who", "member_names", "roles", "tracked_funds"}
 
 MONEY_COLS = {"value", "total_value", "min_total_usd", "value_now", "value_usd",
               "amount_low", "amount_high", "min_bought_usd", "min_sold_usd"}
-COUNT_COLS = {"shares", "shares_after", "shares_now", "shares_prior", "insiders",
+COUNT_COLS = {"net_funds", "funds_new", "funds_added", "funds_cut", "funds_exited", "fund_holders",
+              "shares", "shares_after", "shares_now", "shares_prior", "insiders",
               "members", "buys", "sells", "lag_days", "seq"}
 RATIO_COLS = {"bought_sold_ratio"}
+BACKTEST_PCT = ("ret_5d", "ret_10d", "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm",
+                "median_return", "mean_return", "median_vs_spy", "median_vs_iwm")
+COMPACT_COLS = {"market_cap": "$", "avg_volume": ""}  # shown as $1.2B / 340K; sorted on the number
+STAKE_COLS = {"stake_change", "max_stake_change"}  # percent; math.inf = a brand-new position
 
 CSS = """
 :root{--bg:#fff;--fg:#000;--line:#000;--rule:#bbb;--head:#ececec;--muted:#555;--zebra:#f7f7f7}
@@ -488,6 +622,15 @@ a.back:hover{background:var(--fg);color:var(--bg)}
 .about .src{color:var(--muted);font-size:11px}
 .about details{margin:0 0 6px}
 .about summary{cursor:pointer;font-size:12px;color:var(--muted);margin-bottom:4px}
+.news{margin:0;padding:0;list-style:none}
+.news li{margin:0 0 3px;line-height:1.4}
+.news .when{color:var(--muted);font-size:11px;white-space:nowrap}
+.news .pre{font-size:11px;border:1px solid var(--line);padding:0 3px;margin-right:3px}
+td details summary{cursor:pointer}
+td details[open]{min-width:34ch}
+.newsbox{padding:8px 12px;border-bottom:1px solid var(--rule)}
+svg.spark{vertical-align:middle;margin-right:4px}
+.newsbox h3{margin:0 0 6px;font-size:13px}
 .chartwrap{padding:10px 12px;border-bottom:1px solid var(--rule)}
 .chartwrap svg{border:1px solid var(--rule)}
 nav .navbtn{margin-left:auto;border:0;border-left:1px solid var(--rule);padding:5px 14px;
@@ -526,7 +669,8 @@ td.num{text-align:right;font-family:ui-monospace,Consolas,monospace}
 td.nil{color:var(--muted)}
 .filters input{width:100%;min-width:6em;font:11px ui-monospace,Consolas,monospace;
                background:var(--bg);color:var(--fg);border:1px solid var(--rule);padding:1px 3px}
-.filters select{width:100%;min-width:5em;max-width:18em;font:11px ui-monospace,Consolas,monospace;
+.filters select{width:100%;min-width:5.5em;max-width:7em;  /* an open list still shows whole names */
+                font:11px ui-monospace,Consolas,monospace;
                 background:var(--bg);color:var(--fg);border:1px solid var(--rule);padding:1px 2px}
 .filters select.on{border-color:var(--line);font-weight:700;box-shadow:inset 0 0 0 1px var(--line)}
 .empty{padding:26px 12px;color:var(--muted)}
@@ -613,12 +757,17 @@ COPY_PNG_JS = r"""
     while((node=walker.nextNode())){
       var el=node.parentNode;
       if(el.closest('select,input,option')) continue;
+      // A closed <details> (the news column) keeps its hidden text laid out in Chromium
+      // (content-visibility), so it still has rectangles: skip all of it but the summary line.
+      var fold=el.closest('details');
+      if(fold && !fold.open && !el.closest('summary')) continue;
       var c=cs(el), re=/\S+/g, m, data=node.nodeValue;
       while((m=re.exec(data))){
         var r=document.createRange();
         r.setStart(node,m.index); r.setEnd(node,m.index+m[0].length);
         var txt=c.textTransform==='uppercase'?m[0].toUpperCase():m[0], rects=r.getClientRects();
-        if(rects.length<=1){ fn(txt,rects[0]||r.getBoundingClientRect(),c); continue; }
+        if(!rects.length) continue;  // not rendered: inside a closed <details>, display:none, ...
+        if(rects.length===1){ fn(txt,rects[0],c); continue; }
         for(var i=0;i<m[0].length;i++){  // a word the browser broke across lines: place each letter
           var rr=document.createRange();
           rr.setStart(node,m.index+i); rr.setEnd(node,m.index+i+1);
@@ -632,11 +781,19 @@ COPY_PNG_JS = r"""
     return Array.prototype.filter.call(t.querySelectorAll('tr'),function(r){return !r.classList.contains('filters');});
   }
 
-  // The price chart is an inline SVG; as an image it can't see the page's CSS variables, so
-  // bake the current theme's colours into a copy and rasterise that.
+  // The price chart and the sparklines are inline SVG; as images they can't see the page's CSS
+  // variables, so bake the current theme's colours into a copy and rasterise that.
   function chartImage(){
     var svg=document.querySelector('svg.chart');
-    if(!svg) return Promise.resolve(null);
+    return svg?svgImage(svg):Promise.resolve(null);
+  }
+  function sparkImages(){
+    var list=Array.prototype.slice.call(document.querySelectorAll('table svg.spark'));
+    return Promise.all(list.map(svgImage)).then(function(imgs){
+      var m=new Map(); list.forEach(function(s,i){ if(imgs[i]) m.set(s,imgs[i]); }); return m;
+    });
+  }
+  function svgImage(svg){
     var r=svg.getBoundingClientRect(), clone=svg.cloneNode(true);
     clone.setAttribute('width',r.width); clone.setAttribute('height',r.height);
     clone.style.width=r.width+'px'; clone.style.height=r.height+'px'; clone.style.maxWidth='none';
@@ -674,7 +831,8 @@ COPY_PNG_JS = r"""
 
   function render(){
     styles.clear();
-    return chartImage().then(function(chart){
+    return Promise.all([chartImage(),sparkImages()]).then(function(got){
+    var chart=got[0], sparks=got[1];
     var p=plan(Array.prototype.slice.call(document.querySelectorAll('table')),chart);
     var scale=Math.max(1,Math.min(Math.max(2,Math.ceil(window.devicePixelRatio||1)),MAXPX/p.w,MAXPX/p.h));
     var cv=document.createElement('canvas');
@@ -704,6 +862,10 @@ COPY_PNG_JS = r"""
             if('letterSpacing' in ctx) ctx.letterSpacing=tc.letterSpacing==='normal'?'0px':tc.letterSpacing;
             ctx.fillStyle=tc.color;
             ctx.fillText(txt,PAD+(r.left-it.tr.left),entry.y+(r.top-entry.rect.top)+r.height/2);
+          });
+          cell.querySelectorAll('svg.spark').forEach(function(sv){
+            var im=sparks.get(sv), r=sv.getBoundingClientRect();
+            if(im) ctx.drawImage(im.img,PAD+(r.left-it.tr.left),entry.y+(r.top-entry.rect.top),im.w,im.h);
           });
         });
       });
@@ -773,7 +935,19 @@ def _cell(col, v):
         # ("Ault & Company, Inc."). Render separators as a middle dot so the two
         # can't be confused, and so the browser has somewhere to wrap.
         return " &middot; ".join(_esc(p) for p in _split_list(v)), ""
-    if col == "pct_change" and isinstance(v, (int, float)):
+    if isinstance(v, NewsCell):
+        return v.html(), ""
+    if isinstance(v, ToneCell):
+        return v.html(), ""
+    if isinstance(v, SparkCell):
+        return v.html(), "num"
+    if col in COMPACT_COLS and isinstance(v, (int, float)):
+        return COMPACT_COLS[col] + _compact(v), "num"
+    if col in STAKE_COLS and isinstance(v, (int, float)):
+        return signals.stake_text(v), "num"
+    if col == "beat_spy" and isinstance(v, (int, float)):
+        return f"{v:.0f}%", "num"
+    if col in ("pct_change", "fund_shares_change", "fund_breadth") + BACKTEST_PCT and isinstance(v, (int, float)):
         return f"{v:+,.1f}%", "num"
     if col in RATIO_COLS and isinstance(v, (int, float)):
         return f"{v:,.2f}", "num"
@@ -832,7 +1006,7 @@ def _wrap_cols(rows, cols):
     that SQL results and any column added later get the same treatment."""
     out = set()
     for c in cols:
-        if c in MONEY_COLS or c in COUNT_COLS or c in RATIO_COLS or c == "url":
+        if c in MONEY_COLS or c in COUNT_COLS or c in RATIO_COLS or c in STAKE_COLS or c in COMPACT_COLS or c == "last_30d" or c == "url":
             continue
         for r in rows:
             v = r.get(c)
@@ -917,7 +1091,7 @@ def _plain(col, v):
 def _filter_select(col, rows, current, form_id):
     """Excel-style autofilter: the distinct values of `col` among `rows` (which the
     caller has already narrowed by every OTHER active filter, so options cascade)."""
-    if col == "url":
+    if col in ("url", "news", "last_30d"):  # a link, a fold-out list, a chart: nothing to pick from
         return ""
     vals, blank = set(), False
     for r in rows:
@@ -942,7 +1116,7 @@ def _filter_select(col, rows, current, form_id):
             opts.append(f'<option value="{key}"{sel}>{label}</option>')
     for v in ([] if too_many else sorted(vals, key=_sort_key)):
         key = v if col in LIST_COLS else str(v)
-        label = v if col in LIST_COLS else _plain(col, v)
+        label = v if col in LIST_COLS else str(v) if isinstance(v, ToneCell) else _plain(col, v)
         seen.add(key)
         sel = " selected" if key == current else ""
         opts.append(f'<option value="{_esc(key)}"{sel}>{_esc(label)}</option>')
@@ -956,6 +1130,12 @@ def _filter_select(col, rows, current, form_id):
         tip += f" {len(vals):,} distinct values is too many to list individually."
     return (f'<select name="{SIG_FILTER_PREFIX}{_esc(col)}" form="{form_id}"{cls} '
             f'onchange="this.form.submit()"{_tip(tip)}>{"".join(opts)}</select>')
+
+
+def _head(col) -> str:
+    """A column name for a header cell, allowed to wrap after each underscore: long names like
+    fund_shares_change would otherwise set the column's width on their own."""
+    return "_<wbr>".join(_esc(part) for part in col.split("_"))
 
 
 def _table(rows, cols, sort_href=None, sort_col=None, sort_dir=None, filters=None,
@@ -976,12 +1156,12 @@ def _table(rows, cols, sort_href=None, sort_col=None, sort_dir=None, filters=Non
                 mark = " &#9650;" if sort_dir == "asc" else " &#9660;"
             # Numbers are almost always wanted largest-first on the first click;
             # text almost always A-Z. After that it just toggles.
-            first = "desc" if (c in MONEY_COLS or c in COUNT_COLS or c in RATIO_COLS) else "asc"
+            first = "desc" if (c in MONEY_COLS or c in COUNT_COLS or c in RATIO_COLS or c in STAKE_COLS or c in COMPACT_COLS or c in ("last_30d", "fund_shares_change", "fund_breadth") + BACKTEST_PCT) else "asc"
             nxt = ("desc" if sort_dir == "asc" else "asc") if c == sort_col else first
-            inner = f'<a href="{_esc(sort_href(c, nxt))}">{_esc(c)}{mark}</a>'
+            inner = f'<a href="{_esc(sort_href(c, nxt))}">{_head(c)}{mark}</a>'
             help_text = (help_text + "  Click to sort." if help_text else "Click to sort.")
         else:
-            inner = _esc(c)
+            inner = _head(c)
         out.append(f"<th{cls}{_tip(help_text)}>{inner}</th>")
     out.append("</tr>")
     if filters is not None:
@@ -1084,6 +1264,233 @@ def _window(qs):
     return days, since
 
 
+def _compact(v) -> str:
+    for div, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(v) >= div:
+            return f"{v / div:.1f}{unit}"
+    return f"{v:,.0f}"
+
+
+NEWS_LEAD_DAYS = 30   # how far before a cluster's first buy its news column reaches
+NEWS_IN_CELL = 12
+NEWS_CHART_SINCE = lambda: (dt.date.today() - dt.timedelta(days=60)).isoformat()
+
+
+def _news_item(i, before=None, settings=None) -> str:
+    """One headline or 8-K as a list item. Titles are third-party text: always escaped, and only
+    ever an http(s) link."""
+    day = (i["published"] or "")[:10]
+    mark = '<span class="pre" title="Published before the first buy">before</span>' if before and day < before else ""
+    title = _esc(i["title"])
+    if (i["url"] or "").startswith(("http://", "https://")):
+        title = f'<a href="{_esc(i["url"])}" target="_blank" rel="noopener">{title}</a>'
+    src = "SEC 8-K" if i["kind"] == "8k" else i["source"]
+    score = tone.score_item(i, settings) if settings else None
+    tone_txt = f" &middot; tone {score:+.2f}" if score is not None else ""
+    return f'<li>{mark}{title} <span class="when">{_esc(src)} &middot; {_esc(day)}{tone_txt}</span></li>'
+
+
+class NewsCell(str):
+    """A cluster's news: compares and sorts as its latest item's date, renders as a fold-out list."""
+    def __new__(cls, items, first_buy, settings=None):
+        cell = super().__new__(cls, (items[0]["published"] or "")[:10] if items else "")
+        cell.items, cell.first_buy, cell.settings = items, first_buy, settings
+        return cell
+
+    def html(self):
+        if not self.items:
+            return ""
+        pre = sum(1 for i in self.items if (i["published"] or "")[:10] < (self.first_buy or ""))
+        filings = sum(1 for i in self.items if i["kind"] == "8k")
+        head = f"{len(self.items)} item{'s' if len(self.items) != 1 else ''}"
+        head += f" &middot; {pre} before" if pre else ""
+        head += f" &middot; {filings} 8-K" if filings else ""
+        body = "".join(_news_item(i, self.first_buy, self.settings) for i in self.items)
+        return f'<details><summary>{head}</summary><ul class="news">{body}</ul></details>'
+
+
+SPARK_DAYS = 30
+
+
+class SparkCell(float):
+    """A ticker's last-30-days line: sorts as the percent change, draws as a sparkline."""
+    def __new__(cls, change, svg, first, last):
+        cell = super().__new__(cls, change)
+        cell.svg, cell.first, cell.last = svg, first, last
+        return cell
+
+    def html(self):
+        tip = (f"Close {self.first:,.2f} to {self.last:,.2f} over the last {SPARK_DAYS} days ({self:+.1f}%). "
+               "Shaded: the days the cluster was buying.")
+        return f'<span{_tip(tip)}>{self.svg}{self:+.1f}%</span>'
+
+
+def _add_sparks(conn, rows, fetch=False) -> str:
+    """Attach each row's 30-day sparkline from the price cache. With fetch, tickers whose prices
+    are missing or stale are fetched in the background, and the note says so."""
+    since = (dt.date.today() - dt.timedelta(days=SPARK_DAYS)).isoformat()
+    tickers = list(dict.fromkeys(r["ticker"] for r in rows if r.get("ticker")))
+    for r in rows:
+        meta = prices.get_meta(conn, r["ticker"]) if r.get("ticker") else None
+        bars = prices.bars(conn, meta["symbol"], since) if meta and meta.get("symbol") else []
+        svg = chart.sparkline_svg(bars, (r.get("first_buy"), r.get("last_buy")))
+        r["last_30d"] = (SparkCell(100 * (bars[-1]["close"] / bars[0]["close"] - 1), svg,
+                                   bars[0]["close"], bars[-1]["close"]) if svg and bars[0]["close"] else None)
+    need = prices.stale(conn, tickers) if fetch else []
+    if not (need and prices.refresh_in_background(_db_file(conn), need)):
+        return ""
+    return (f'<p class="note">Fetching prices for {len(need):,} ticker{"s" if len(need) != 1 else ""} from '
+            "Yahoo Finance in the background, for the last_30d column. Reload in a minute.</p>")
+
+
+# One-click screens: a label, the query they set, and what they're for. Each is just a link, so
+# the result can be bookmarked, adjusted with the controls, or shared like any other view.
+PRESETS = {
+    "fund_overlap": [
+        ("Conviction screen", dict(days=30, p_min_insiders=2, p_min_net_funds=1, sort="fund_breadth", dir="desc"),
+         "Two or more insiders buying in the last 30 days, in stocks institutions were net buying, ranked by "
+         "fund breadth (net buyers as a share of holders) so smaller stocks being discovered rise to the top."),
+        ("Top executives", dict(days=30, p_min_insiders=1, p_min_net_funds=1, sf_roles="CEO", sort="fund_breadth",
+                                dir="desc"),
+         "Any purchase that includes the CEO, in stocks institutions were net buying, ranked by fund breadth."),
+    ],
+}
+
+
+def _presets(view_key) -> str:
+    links = [f'<a href="/signals?{_qs(view=view_key, **params)}"{_tip(tip)}>{_esc(label)}</a>'
+             for label, params, tip in PRESETS.get(view_key, [])]
+    return f'<p class="note">Screens: {" &middot; ".join(links)}</p>' if links else ""
+
+
+def _backtest_summary(conn, rows) -> str:
+    """The headline tables above the Backtest list, and a background top-up of any stale prices
+    (each cluster's and the benchmarks'), so the results keep up without anyone re-running them."""
+    need = prices.stale(conn, [*{r["ticker"] for r in rows}, *backtest.BENCHMARKS])
+    fetching = ""
+    if need and prices.refresh_in_background(_db_file(conn), need):
+        fetching = (f'<p class="note">Updating prices for {len(need):,} ticker{"s" if len(need) != 1 else ""} '
+                    "in the background; reload in a minute for the latest returns.</p>")
+    first = conn.execute("SELECT MIN(filed_date) FROM insider_tx").fetchone()[0] or "-"
+    missing = sum(1 for r in rows if r.get("status") == "no prices yet")
+    caps = quotes.get_many(conn, [r["ticker"] for r in rows])
+    return (fetching
+            + f'<p class="note">Clusters since {_esc(first)} (the first filing in this database), each bought at '
+              "the next open after it became public. With only weeks of history these figures are a first look, "
+              "not evidence: they firm up as filings accumulate."
+            + (f" {missing} cluster{'s' if missing != 1 else ''} had no price history and are left out, which "
+               "flatters the results (delisted stocks are often the losers)." if missing else "") + "</p>"
+            + _table(backtest.summary(rows), ["horizon", "events", "median_return", "mean_return", "beat_spy",
+                                              "median_vs_spy", "median_vs_iwm", "reliability"])
+            + '<p class="note" style="border-bottom:none">By kind of cluster, return to the latest close:</p>'
+            + _table(backtest.groups(rows, caps), ["group", "events", "median_vs_iwm", "median_vs_spy"])
+            + '<p class="note" style="border-bottom:none">Every cluster:</p>')
+
+
+def _fund_note(conn) -> str:
+    """Which 13F quarters the fund columns compare, or how to load them."""
+    meta = funds.latest(conn)
+    if not meta:
+        return ('<p class="note"><strong>No 13F data loaded yet.</strong> Run <em>Funds</em> on the '
+                '<a href="/jobs">Jobs</a> tab (or <code>python -m insider_tracker funds</code>): it downloads the '
+                "SEC's two latest quarterly 13F data sets, about 200 MB, and takes a minute or two.</p>")
+    return (f'<p class="note"{_tip("A 13F shows positions on the last day of a quarter, filed up to 45 days later; the SEC publishes each quarterly data set after that. Run Funds on the Jobs tab once a new one is out (early March, June, September, December).")}>'
+            f"Fund columns: 13F positions on <strong>{_esc(meta['period'])}</strong> against "
+            f"{_esc(meta['prior_period'])}, across {meta['compared']:,} institutions that filed both quarters. "
+            "That quarter ended before most of this insider buying, so it shows what funds were doing "
+            "beforehand.</p>")
+
+
+def _tone_settings():
+    """The saved tone settings, or None when VADER isn't installed or tone.toml is broken (the
+    Tone tab says which); every tone cell is then blank rather than an error."""
+    if not tone.available():
+        return None
+    try:
+        return tone.load()
+    except tone.SettingsError:
+        return None
+
+
+class ToneCell(str):
+    """A cluster's headline tone: compares, sorts and filters as its label, shows the evidence."""
+    def __new__(cls, summary):
+        cell = super().__new__(cls, summary[0] if summary else "")
+        cell.avg, cell.n = (summary[1], summary[2]) if summary else (None, 0)
+        return cell
+
+    def html(self):
+        if not self:
+            return ""
+        what = f"{self.n} headline{'s' if self.n != 1 else ''}"
+        return (f'{_esc(str(self))} <span class="nil" title="Average score from -1 to +1, over '
+                f'{what} from before the first buy">{self.avg:+.2f} &middot; {self.n}</span>')
+
+
+def _cluster_news(items, first_buy) -> list:
+    """What a cluster's cell lists, newest first: every 8-K, and headlines split so that a burst of
+    recent stories can't crowd out the ones from before the buying started (the useful context)."""
+    day = lambda i: (i["published"] or "")[:10]
+    filings = [i for i in items if i["kind"] == "8k"]
+    heads = [i for i in items if i["kind"] != "8k"]
+    before = [i for i in heads if first_buy and day(i) < first_buy][:NEWS_IN_CELL // 2]
+    after = [i for i in heads if not (first_buy and day(i) < first_buy)][:NEWS_IN_CELL - len(before)]
+    return sorted(filings + before + after, key=lambda i: i["published"] or "", reverse=True)
+
+
+def _add_news(conn, rows, fetch=False) -> str:
+    """Attach each cluster's news (from a month before its first buy) as a NewsCell. With fetch,
+    tickers not looked at recently are fetched in the background, and the note says so."""
+    tickers = [r["ticker"] for r in rows if r.get("ticker")]
+    settings = _tone_settings()
+    for r in rows:
+        if not r.get("ticker"):
+            continue
+        since = (dt.date.fromisoformat(r["first_buy"]) - dt.timedelta(days=NEWS_LEAD_DAYS)).isoformat() \
+            if r.get("first_buy") else None
+        items = news.get(conn, r["ticker"], since, 200)
+        r["news"] = NewsCell(_cluster_news(items, r.get("first_buy")), r.get("first_buy"), settings)
+        lead = (dt.date.fromisoformat(r["first_buy"]) - dt.timedelta(days=settings["lead_days"])).isoformat() \
+            if settings and r.get("first_buy") else None
+        before = [i for i in items if lead and lead <= (i["published"] or "")[:10] < r["first_buy"]]
+        r["news_tone"] = ToneCell(tone.summarize(before, settings)) if settings else ToneCell(None)
+    need = news.stale(conn, tickers) if fetch else []
+    if not (need and news.refresh_in_background(_db_file(conn), need)):
+        return ""
+    return (f'<p class="note">Fetching news for {len(need):,} ticker{"s" if len(need) != 1 else ""} '
+            "(Yahoo Finance headlines and SEC 8-K filings) in the background. Reload in a minute.</p>")
+
+
+def _news_html(items) -> str:
+    """The chart page's news block: the last two months of headlines and 8-K filings."""
+    if not items:
+        return ""
+    return ('<div class="newsbox"><h3>Recent news</h3><ul class="news">'
+            + "".join(_news_item(i, settings=_tone_settings()) for i in items)
+            + '</ul><p class="src" style="margin:6px 0 0;color:var(--muted);font-size:11px">Headlines: Yahoo '
+              'Finance (an unofficial source). Filings: SEC EDGAR.</p></div>')
+
+
+def _add_quotes(conn, rows, fetch=False) -> str:
+    """Attach cached market cap and average volume to each row. With fetch, missing or stale
+    tickers are fetched on a background thread, and the returned note says so."""
+    tickers = list(dict.fromkeys(r["ticker"] for r in rows if r.get("ticker")))
+    have = quotes.get_many(conn, tickers)
+    for r in rows:
+        q = have.get(r.get("ticker")) or {}
+        r["market_cap"], r["avg_volume"] = q.get("market_cap"), q.get("avg_volume")
+    need = quotes.stale(conn, tickers) if fetch else []
+    if not (need and quotes.refresh_in_background(_db_file(conn), need)):
+        return ""
+    return (f'<p class="note"{_tip("Yahoo Finance is unofficial, so cells it cannot fill stay blank.")}>'
+            f"Fetching market cap and volume for {len(need):,} ticker{'s' if len(need) != 1 else ''} "
+            "from Yahoo Finance in the background. Reload in a minute to see them.</p>")
+
+
+def _db_file(conn) -> str:
+    return conn.execute("PRAGMA database_list").fetchone()[2]
+
+
 def page_signals(conn, qs):
     key = _one(qs, "view", VIEWS[0].key)
     view = VIEWS_BY_KEY.get(key, VIEWS[0])
@@ -1100,6 +1507,15 @@ def page_signals(conn, qs):
             f'value="{_esc(val)}"></label>')
 
     all_rows = view.fn(conn, since, **kwargs) if view.takes_since else view.fn(conn, **kwargs)
+    market_note = _add_quotes(conn, all_rows, fetch=True) if "market_cap" in view.cols else ""
+    if "news" in view.cols or "news_tone" in view.cols:  # the tone is read from the same news
+        market_note += _add_news(conn, all_rows, fetch=True)
+    if "last_30d" in view.cols:
+        market_note += _add_sparks(conn, all_rows, fetch=True)
+    if "net_funds" in view.cols:
+        market_note = _fund_note(conn) + market_note
+    if view.key == "backtest":
+        market_note = _backtest_summary(conn, all_rows) + market_note
     dfl = _read_date_filters(qs, view.date_filters)
     pool = _apply_date_filters(all_rows, dfl)  # date ranges narrow first, so dropdown options follow
     flt = _read_signal_filters(qs, view.cols)
@@ -1144,7 +1560,7 @@ def page_signals(conn, qs):
   <a href="{_esc(csv_href)}"><button type="button" class="ghost"
      {_tip(CONTROL_HELP['csv'])}>CSV</button></a>
 </form>
-{f'<p class="note">{_esc(view.note)}</p>' if view.note else ''}
+{f'<p class="note">{_esc(view.note)}</p>' if view.note else ''}{_presets(view.key)}{market_note}
 {_table(rows, view.cols, sort_href=_sorter("/signals", base), sort_col=sort, sort_dir=direction,
         filter_cells=filter_cells)}
 <div class="count"><span>{f"{len(rows):,} of {len(all_rows):,} rows" if (flt or dfl) else f"{len(rows):,} rows"}</span>
@@ -1284,10 +1700,11 @@ def page_chart(conn, qs, meta, referer=None):
     issuer = next((r[0] for r in conn.execute(
         "SELECT issuer_name FROM insider_tx WHERE ticker LIKE ? AND issuer_name<>'' LIMIT 50", (like,))
         if r[0]), "")
-    bands = [{"first": b["first_buy"], "last": b["last_buy"],
-              "label": f"Cluster: {b['insiders']} insiders bought {b['first_buy']} to {b['last_buy']}, "
-                       f"${b['total_value'] or 0:,.0f} in total"}
-             for b in signals.cluster_buys(conn, since) if same(b["ticker"])]
+    # every separate bout of buying in the range, not the whole range as one group
+    bands = [{"first": b["first"], "last": b["last"],
+              "label": f"Cluster: {b['insiders']} insiders bought {b['first']} to {b['last']}, "
+                       f"${b['total_value']:,.0f} in total"}
+             for b in signals.cluster_episodes(ins)]
 
     symbol = meta.get("symbol") if meta else None
     bar_rows = prices.bars(conn, symbol, since) if symbol else []
@@ -1337,6 +1754,7 @@ def page_chart(conn, qs, meta, referer=None):
   >&larr; Back</a><strong>{_esc(ticker)}</strong>
   <span class="nil">{_esc(issuer)}</span></div>
 {_about_html(profiles.get(conn, ticker))}
+{_news_html(news.get(conn, ticker, NEWS_CHART_SINCE()))}
 <div class="tabs">{range_tabs}</div>
 {main}
 <p class="note">{info}</p>
@@ -1575,6 +1993,138 @@ def save_watchlist_from_form(fields: dict):
     return detail
 
 
+TONE_SHOW = {"all": "all headlines", "labeled": "labelled by you", "unlabeled": "not labelled yet",
+             "disagree": "where the score disagrees with you", "bad": "scored bad",
+             "good": "scored good"}
+TONE_ROWS = 300
+VERDICT = {1: "good", 0: "neutral", -1: "bad"}
+
+
+def page_tone(conn, qs, preview=None, form=None, error=None):
+    """Tune headline tone: your labels, the agreement they give, the settings, and the headlines."""
+    if not tone.available():
+        return _page("Tone", "tone", '<p class="empty">Headline tone needs VADER: run '
+                                     '<code>pip install -r requirements.txt</code> and restart.</p>')
+    try:
+        saved = tone.load()
+    except tone.SettingsError as exc:
+        saved, error = tone.validate({}), error or f"tone.toml couldn't be read, so the built-in settings are shown: {exc}"
+    current = preview or saved
+    labels = tone.load_labels()
+    show = _one(qs, "show", "all")
+    show = show if show in TONE_SHOW else "all"
+    q = (_one(qs, "q", "") or "").strip()
+
+    def stats_line(a, title):
+        if not a["labeled"]:
+            return f"<li>{title}: label some headlines below to measure this.</li>"
+        pct = lambda x, n: f"{x}/{n}" + (f" ({x / n:.0%})" if n else "")
+        return (f"<li><strong>{title}</strong>: agrees with you on {pct(a['agree'], a['labeled'])} &middot; "
+                f"bad news caught {pct(a['bad_caught'], a['bad'])} &middot; good news caught "
+                f"{pct(a['good_caught'], a['good'])} &middot; called bad when it wasn't: {a['false_bad']} "
+                f"&middot; opposite of you: {a['opposite']}</li>")
+    a_saved = tone.agreement(labels, saved)
+    a_now = tone.agreement(labels, current) if preview else a_saved
+    stats = stats_line(a_saved, "Saved settings")
+    if preview:
+        stats += stats_line(a_now, "This preview (not saved)")
+
+    text = lambda k, default: (form.get(k) or [default])[0] if form else default
+    num = lambda k: _esc(text(k, f"{current[k]:g}"))
+    banner = ""
+    if _one(qs, "detail"):
+        banner = f'<p class="note" style="border-bottom:none">{_esc(_one(qs, "detail"))}</p>'
+    if error:
+        banner += f'<p class="note" style="border-bottom:none"><strong>Not saved:</strong> {_esc(error)}</p>'
+
+    rows = conn.execute(
+        "SELECT title, MAX(published) AS published, MIN(ticker) AS ticker FROM news_items "
+        "WHERE kind='headline' GROUP BY title ORDER BY published DESC").fetchall()
+    freq = tone.frequent_words([r["title"] for r in rows], current)
+    freq_html = ("<details class=\"note\"><summary>The scored words that turn up most in your "
+                 f"{len(rows):,} headlines</summary><p>"
+                 + " &middot; ".join(f"{_esc(w)} <span class=\"nil\">{n}&times; {v:+g}{' (set here)' if mine else ''}</span>"
+                                     for w, n, v, mine in freq)
+                 + "</p><p class=\"nil\">A company or fund name, a disease, or jargon that VADER reads as emotion "
+                   "(VADER gives 'shares' +1.2) skews every headline it appears in: set it to 0 in the word "
+                   "weights.</p></details>") if freq else ""
+    shown = []
+    for r in rows:
+        title = r["title"]
+        if q and q.lower() not in title.lower():
+            continue
+        score, drivers = tone.explain(title, current)
+        verdict = tone.classify(score, current)
+        mine = labels.get(title)
+        keep = {"all": True, "labeled": mine is not None, "unlabeled": mine is None,
+                "disagree": mine is not None and mine != verdict, "bad": verdict == -1,
+                "good": verdict == 1}[show]
+        if keep:
+            shown.append((r, score, drivers, verdict, mine))
+    back = _qs(show=show, q=q) if q else _qs(show=show)
+    body_rows = []
+    for r, score, drivers, verdict, mine in shown[:TONE_ROWS]:
+        why = ", ".join(f"{_esc(n)} {v:+g}" for n, v in drivers[:4]) or '<span class="nil">no scored words</span>'
+        buttons = "".join(
+            f'<button type="submit" name="label" value="{v}"{ON if VERDICT.get(mine) == v else ""}'
+            f'{_tip("Remove your label" if v == "clear" else f"Label this headline {v} news for the stock")}>{v}</button>'
+            for v in ("good", "neutral", "bad", "clear") if v != "clear" or mine is not None)
+        flag = (' style="font-weight:bold"' if mine is not None and mine != verdict else "")
+        body_rows.append(
+            f'<tr><td>{_esc((r["published"] or "")[:10])}</td><td>{_cell("ticker", r["ticker"])[0]}</td>'
+            f'<td class="txt">{_esc(r["title"])}</td><td class="num"{flag}>{score:+.2f} {VERDICT[verdict]}</td>'
+            f'<td class="txt">{why}</td><td>{VERDICT.get(mine, "")}</td>'
+            f'<td><form method="post" action="/tone/label" style="margin:0">'
+            f'<input type="hidden" name="title" value="{_esc(r["title"])}">'
+            f'<input type="hidden" name="back" value="{_esc(back)}">{buttons}</form></td></tr>')
+    heads = [("date", "When the headline was published."), ("ticker", "The company it was fetched for."),
+             ("headline", "As the publisher wrote it."),
+             ("score", "VADER's score with the settings above, -1 to +1, and what it counts as. Bold when it "
+                       "disagrees with your label."),
+             ("why", "The words and phrases that carried the score, with their weights. Change a weight in "
+                     "the settings to change how much it counts."),
+             ("yours", "Your label, if you've given one."), ("label", "Say what this headline means for the stock.")]
+    table = ('<div class="wrap"><table><thead><tr>'
+             + "".join(f"<th{_tip(t)}>{_esc(h)}</th>" for h, t in heads) + "</tr></thead><tbody>"
+             + "".join(body_rows) + "</tbody></table></div>") if body_rows else \
+        '<p class="empty">No headlines match. News is fetched when the Insider cluster buys tab or a chart is opened.</p>'
+    show_links = " &middot; ".join(
+        f'<a href="/tone?{_qs(show=k, q=q) if q else _qs(show=k)}"{ON if k == show else ""}>{_esc(v)}</a>'
+        for k, v in TONE_SHOW.items())
+
+    body = f"""{banner}
+<p class="note">How well the headline scores match your own reading of {len(labels):,} labelled headline{'s' if len(labels) != 1 else ''}.
+Bad news is counted separately because it is rare and it is what the news_tone column most needs to get right.
+Change the settings, press <em>Preview</em> to see the effect, and <em>Save</em> when it's better.</p>
+<ul class="note" style="margin:0;padding:6px 12px 6px 30px">{stats}</ul>
+{freq_html}
+<form method="post" action="/tone">
+  <div class="bar">
+    <label{_tip("One headline at or beyond plus/minus this score counts as good or bad news (VADER's own convention is 0.05).")}>headline cut <input type="number" step="any" name="item_cut" value="{num('item_cut')}"></label>
+    <label{_tip("A set of headlines whose average is beyond plus/minus this reads positive or negative.")}>tone cut <input type="number" step="any" name="label_at" value="{num('label_at')}"></label>
+    <label{_tip("Otherwise the set is 'mixed' if it holds at least one headline this bad and one this good.")}>mixed at <input type="number" step="any" name="mixed_at" value="{num('mixed_at')}"></label>
+    <label{_tip("A cluster's tone covers headlines from this many days before its first buy.")}>days before <input type="number" step="1" name="lead_days" value="{num('lead_days')}"></label>
+  </div>
+  <div class="bar"><label{_tip("One per line: word = weight, on VADER's scale of about -4 (worst news) to +4 (best). 0 makes a word count for nothing, for words that are only bad news outside finance (cancer, crude, gross).")}>Word weights</label></div>
+  <textarea name="words" style="height:12em" spellcheck="false">{_esc(text('words', tone.words_text(current)))}</textarea>
+  <div class="bar"><label{_tip("One per line: name: pattern = weight. The pattern is a regular expression (case-insensitive) matched across the headline, so it can catch phrases a single word can't: 'cuts guidance', 'misses estimates'.")}>Phrase rules</label></div>
+  <textarea name="phrases" style="height:10em" spellcheck="false">{_esc(text('phrases', tone.phrases_text(current)))}</textarea>
+  <div class="bar"><label{_tip("8-K filings whose type is bad news by nature, scored -1 to 0. Other 8-Ks aren't scored.")}>Bad 8-K types</label></div>
+  <textarea name="bad_8k" style="height:6em" spellcheck="false">{_esc(text('bad_8k', tone.bad_8k_text(current)))}</textarea>
+  <div class="bar">
+    <button type="submit" name="action" value="preview"{_tip("Re-score everything below with these settings. Nothing is saved.")}>Preview</button>
+    <button type="submit" name="action" value="save"{_tip("Write these settings to tone.toml; the news_tone column uses them from now on.")}>Save</button>
+    <button type="submit" name="action" value="reset" class="ghost"{_tip("Delete tone.toml and go back to the built-in settings.")}>Reset to built-in</button>
+  </div>
+</form>
+<form class="bar" method="get" action="/tone"><input type="hidden" name="show" value="{_esc(show)}">
+  <label{_tip("Only headlines containing this text.")}>search <input type="text" name="q" value="{_esc(q)}"></label>
+  <button type="submit">Find</button> <span>{show_links}</span></form>
+{table}
+<div class="count"><span>{min(len(shown), TONE_ROWS):,} of {len(shown):,} headlines{' (scored with the preview)' if preview else ''}</span></div>"""
+    return _page("Tone", "tone", body, meta=f"{len(labels):,} labelled")
+
+
 def page_watchlist(qs):
     wl = config.load_watchlist()
     tickers_text = "\n".join(wl.get("tickers", []))
@@ -1614,7 +2164,7 @@ there is no per-ticker filter for Congress, only per-source date windows.</p>"""
 # ---------- jobs ----------
 
 JOB_LABELS = {"form4": "Form 4", "house": "House", "senate": "Senate",
-             "13f": "13F", "update": "Update (all + report)"}
+             "13f": "13F", "funds": "Funds", "update": "Update (all + report)"}
 
 
 def _job_form(source, label, fields_html, tip):
@@ -1665,6 +2215,10 @@ def page_jobs(qs):
                  f'<label{_tip("How many past quarters to fetch per manager.")}>quarters '
                  f'<input type="number" name="quarters" value="4" min="1"></label>',
                  "Run 13F now, in the background. Needs managers in the Watchlist tab."),
+        _job_form("funds", "Funds", "",
+                 "Download the SEC's two newest quarterly 13F data sets (every institution, about 200 MB, "
+                 "only when they're new) and rebuild the fund columns of Fund / insider overlap. Takes a "
+                 "minute or two; worth running once a quarter."),
         _job_form("update", "Update (all + report)", "",
                  "Run every source in turn -- Form 4 for all issuers over the last 3 days, "
                  "House for this year, Senate for the last 30 days, then 13F -- and rebuild the "
@@ -1695,13 +2249,73 @@ STATUS_HELP = {
                             "house and senate ingests.",
     "13F filings": "How many quarterly institutional filings are stored. Zero until you run "
                    "the 13f ingest with managers configured.",
+    "stored data": "Everything this app keeps on disk. The database file and the other files are exact "
+                   "sizes; the per-table figures inside the database are estimates (the stored values "
+                   "added up, without indexes or SQLite's own overhead), so they won't sum to the file.",
     "insider date range": "Earliest and latest trade date in the database. If a view looks "
                           "empty, check the window against this range first.",
 }
 
 
 PROC_COLS = ["source", "status", "n"]
+STORAGE_COLS = ["stored", "rows", "size", "what"]
+TABLE_PURPOSE = {
+    "insider_tx": "Form 4 transactions", "insider_holdings": "Form 4 holdings with no trade",
+    "congress_tx": "House and Senate trades", "holdings_13f": "13F positions",
+    "processed": "what each ingest has done", "prices": "daily prices for charts and sparklines",
+    "price_meta": "when each ticker's prices were fetched", "profiles": "company descriptions",
+    "quotes": "market cap and average volume", "news_items": "headlines and 8-K filings",
+    "news_meta": "when each ticker's news was fetched", "cusip_ticker": "13F CUSIP to ticker lookups",
+    "alert_log": "trades the Discord bot has handled", "alert_groups": "Discord bot cooldowns",
+    "fund_flows": "every 13F filer's changes, per stock", "fund_tracked": "your watchlist managers' 13F positions",
+    "fund_meta": "which 13F quarters were compared",
+}
 ERR_COLS = ["source", "doc_id", "note", "processed_at"]
+
+
+def _size(n) -> str:
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:,.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _dir_size(path) -> int:
+    path = Path(path)
+    if path.is_file():
+        return path.stat().st_size
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) if path.is_dir() else 0
+
+
+def _storage_rows(conn) -> tuple:
+    """The database file (exact), each table inside it (rows, and an estimated size), and the other
+    files the app keeps (exact). Per-table sizes are estimated because this SQLite build has no dbstat."""
+    db_file = Path(_db_file(conn))
+    files = [db_file] + [db_file.with_name(db_file.name + x) for x in ("-wal", "-shm")]
+    total = sum(_dir_size(f) for f in files)
+    rows = [{"stored": db_file.name, "rows": None, "size": _size(total),
+             "what": "the database: every table below (exact file size, including its write-ahead log)"}]
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    sized = []
+    for t in tables:
+        cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{t}")')]
+        expr = " + ".join(f'COALESCE(LENGTH(CAST("{c}" AS BLOB)), 0)' for c in cols) or "0"
+        n, est = conn.execute(f'SELECT COUNT(*), COALESCE(SUM({expr}), 0) FROM "{t}"').fetchone()
+        sized.append((est, {"stored": f"  {t}", "rows": n, "size": "about " + _size(est),
+                            "what": TABLE_PURPOSE.get(t, "")}))
+    rows += [r for _, r in sorted(sized, key=lambda x: -x[0])]
+    others = [(funds.DIR, "the SEC's quarterly 13F data sets (re-downloadable; the two newest are kept)"),
+              (config.REPORT_DIR, "Markdown and CSV reports"), (config.WATCHLIST_PATH, "your watchlist"),
+              (tone.CONFIG_PATH, "your headline-tone settings"), (tone.LABELS_PATH, "your headline labels"),
+              (Path(os.environ.get("INSIDER_ALERTS", "alerts.toml")), "Discord alert rules")]
+    for path, what in others:
+        if Path(path).exists():
+            total += _dir_size(path)
+            rows.append({"stored": str(path), "rows": None, "size": _size(_dir_size(path)), "what": what})
+    rows.append({"stored": "TOTAL", "rows": sum(r["rows"] or 0 for r in rows), "size": _size(total),
+                 "what": "everything above: the database file plus the other files (exact)"})
+    return rows, total
 
 
 def page_status(conn, qs):
@@ -1733,7 +2347,12 @@ def page_status(conn, qs):
         f"<dt{_tip(STATUS_HELP.get(k, ''))}>{_esc(k)}</dt>"
         f"<dd>{_esc(f'{v:,}' if isinstance(v, int) else v)}</dd>"
         for k, v in counts)
+    storage, total = _storage_rows(conn)
+    dl += f"<dt{_tip(STATUS_HELP['stored data'])}>stored data</dt><dd>{_size(total)} in total</dd>"
     body = f"""<dl>{dl}</dl>
+<p class="note"{_tip(STATUS_HELP['stored data'])}>Stored data: the database file and the other files this app keeps.
+Table sizes inside the database are estimates.</p>
+{_table(storage, STORAGE_COLS)}
 <p class="note">Ingest status by source. Anything in <code>error</code> retries on the next run.</p>
 {_table(proc, PROC_COLS, sort_href=_sorter("/status", {}), sort_col=psort, sort_dir=pdir)}
 {'<p class="note">Most recent errors.</p>' + _table(errors, ERR_COLS, sort_href=_sorter("/status", {}, "esort", "edir"), sort_col=esort, sort_dir=edir) if errors else ''}"""
@@ -1755,12 +2374,12 @@ DESIGN_NOTES = [
      "module fetches whatever format the source actually exposes -- a daily "
      "index file, a PDF, a paginated HTML search form -- and reduces it to "
      "plain rows. That is also why they are the most fragile part of the app."),
-    ("Read-only by construction, except three narrow, named exceptions",
+    ("Read-only by construction, except four narrow, named exceptions",
      "Signals, Raw tables, SQL, Status and Architecture never write: every "
      "connection they open runs PRAGMA query_only, so even a bug there cannot "
-     "touch the database, including from the SQL console. Watchlist, Jobs and "
+     "touch the database, including from the SQL console. Watchlist, Tone, Jobs and "
      "the price chart are the deliberate exceptions -- Watchlist writes watchlist.json "
-     "(never the database), Jobs starts a background thread that calls the same "
+     "and Tone writes tone.toml and tone_labels.json (never the database), Jobs starts a background thread that calls the same "
      "ingest() functions the CLI does, and opening a ticker's chart fetches its prices and "
      "description once and caches them (prices, price_meta and profiles, on a separate connection). "
      "Nothing else here writes anything."),
@@ -1821,7 +2440,7 @@ def _csv_bytes(rows, cols):
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
     w.writeheader()
-    w.writerows(rows)
+    w.writerows(signals.csv_safe(rows))
     return buf.getvalue().encode("utf-8")
 
 
@@ -1860,6 +2479,12 @@ class _Handler(BaseHTTPRequestHandler):
                 kwargs = {p.name: _one(qs, PARAM_PREFIX + p.name, p.default, p.cast)
                           for p in view.params}
                 rows = view.fn(conn, since, **kwargs) if view.takes_since else view.fn(conn, **kwargs)
+                if "market_cap" in view.cols:
+                    _add_quotes(conn, rows)  # what is cached; a download never waits on Yahoo
+                if "news" in view.cols or "news_tone" in view.cols:
+                    _add_news(conn, rows)
+                if "last_30d" in view.cols:
+                    _add_sparks(conn, rows)
                 rows = _apply_date_filters(rows, _read_date_filters(qs, view.date_filters))
                 rows = _apply_filters(rows, _read_signal_filters(qs, view.cols))
                 csort, cdir = _read_sort(qs, view.cols)
@@ -1878,10 +2503,13 @@ class _Handler(BaseHTTPRequestHandler):
                 price_meta = prices.safe_ensure(self.db_path, t) if t else None
                 if t:  # the description needs the symbol the price lookup settled on
                     profiles.safe_ensure(self.db_path, t, (price_meta or {}).get("symbol"))
+                    news.safe_ensure(self.db_path, t)
                 html_out = page_chart(conn, qs, price_meta,
                                       referer_path(self.headers.get("Referer"), self.headers.get("Host")))
             elif route == "/watchlist":
                 html_out = page_watchlist(qs)
+            elif route == "/tone":
+                html_out = page_tone(conn, qs)
             elif route == "/jobs":
                 html_out = page_jobs(qs)
             elif route == "/status":
@@ -1906,7 +2534,36 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         fields = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
 
-        if route == "/watchlist":
+        if route == "/tone":
+            action = (fields.get("action") or ["save"])[0]
+            if action == "reset":
+                tone.reset()
+                location = f"/tone?{_qs(detail='Back to the built-in settings.')}"
+            else:
+                try:
+                    settings = tone.from_form(fields)
+                    error = None
+                except tone.SettingsError as exc:
+                    settings, error = None, str(exc)
+                if action == "save" and settings:
+                    tone.save(settings)
+                    location = f"/tone?{_qs(detail='Saved to tone.toml.')}"
+                else:  # a preview, or a mistake to fix: show the page, write nothing
+                    conn = _connect(self.db_path, read_only=True)
+                    try:
+                        body = page_tone(conn, {}, preview=settings, form=fields, error=error)
+                    finally:
+                        conn.close()
+                    self._send(body.encode("utf-8"), "text/html; charset=utf-8")
+                    return
+        elif route == "/tone/label":
+            one = lambda k: (fields.get(k) or [""])[0]
+            value = {"good": 1, "neutral": 0, "bad": -1}.get(one("label"))
+            if one("title"):
+                tone.set_label(one("title"), value)
+            back = one("back")
+            location = "/tone" + (f"?{back}" if back and "\n" not in back and "\r" not in back else "")
+        elif route == "/watchlist":
             try:
                 detail = save_watchlist_from_form(fields)
                 location = f"/watchlist?{_qs(detail=detail)}"
