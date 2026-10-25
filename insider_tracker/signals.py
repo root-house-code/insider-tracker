@@ -118,13 +118,82 @@ def _rows(conn, sql, params=()):
     return [dict(r) for r in conn.execute(sql, params)]
 
 
-def cluster_buys(conn, since: str, min_insiders: int = 2):
+HISTORY_YEARS = 3
+BUYER_ORDER = ["first buy", "occasional", "routine", "unknown"]
+
+
+def purchase_months(conn, issuer_ciks) -> dict:
+    """{(issuer_cik, insider): {'YYYY-MM', ...}} -- every month each insider bought each of these
+    companies' stock. The insider is the first CIK on the filing (as the Discord bot counts them)."""
+    ciks = sorted({str(c) for c in issuer_ciks if c})
+    out = {}
+    for i in range(0, len(ciks), 500):
+        part = ciks[i:i + 500]
+        for issuer, owner, month in conn.execute(
+                f"SELECT issuer_cik, owner_cik, substr(trans_date, 1, 7) FROM insider_tx "
+                f"WHERE issuer_cik IN ({','.join('?' * len(part))}) AND code='P' AND is_derivative=0",
+                part):
+            who = (owner or "").split(";")[0].strip().lstrip("0")
+            out.setdefault((issuer, who), set()).add(month)
+    return out
+
+
+def buyer_type(months, trans_date, data_start) -> str:
+    """What kind of buyer an insider was at the time of a purchase, judged only by the three years
+    before it (adapted from Cohen, Malloy and Pomorski, 2012: 'routine' insiders trade in the same
+    month every year and their trades carry little information; the rest are 'opportunistic').
+
+      routine     bought in this same calendar month in each of the previous three years
+      first buy   no purchases of this company's stock in the previous three years
+      occasional  anything in between
+      unknown     the database doesn't reach three years back from this purchase"""
+    year, month = int(trans_date[:4]), trans_date[5:7]
+    if f"{year - HISTORY_YEARS}{trans_date[4:]}" < (data_start or "9999"):
+        return "unknown"
+    if all(f"{year - k}-{month}" in months for k in range(1, HISTORY_YEARS + 1)):
+        return "routine"
+    earlier = f"{year - HISTORY_YEARS}-{month}"
+    if not any(earlier <= m < trans_date[:7] for m in months):
+        return "first buy"
+    return "occasional"
+
+
+def data_start(conn) -> str:
+    """The earliest filing date of a purchase in the database: history checks can't reach before it."""
+    return conn.execute("SELECT MIN(filed_date) FROM insider_tx WHERE code='P'").fetchone()[0] or ""
+
+
+def lockstep(buys) -> bool:
+    """Every insider paid the identical price on the same day: the mark of an IPO allocation, a
+    private placement or a company purchase plan, not of people independently deciding to buy."""
+    people = {b["owner_name"] for b in buys}
+    terms = {(b["trans_date"], round(b["price"] or 0, 2)) for b in buys}  # to the cent: the SEC data sets round
+    return len(people) >= 2 and len(terms) == 1
+
+
+REIT_SIC = "6798"
+
+
+def noise_flags(is_fund: bool, buys, buyers="", is_reit=False) -> str:
+    """The 'flags' value for a cluster: bare-comma list, so the filter can pick one.
+      routine  every insider who bought was a routine buyer (same month each of the last three years)
+      reit     a real estate investment trust: REIT clusters trailed small caps in both 2015-2020 and
+               2021-2026 (backtest), unlike most other kinds of company"""
+    return ",".join(f for f, on in (("fund", is_fund), ("lockstep", lockstep(buys)),
+                                    ("routine", buyers == "routine"), ("reit", is_reit)) if on)
+
+
+def cluster_buys(conn, since: str, min_insiders: int = 2, hide_noise: int = 1):
+    """Several insiders buying one company on the open market. `flags` marks clusters that are
+    probably not discretionary buying -- a fund's directors, or everyone at one price on one day
+    (an IPO or placement) -- and hide_noise (the default) leaves those out."""
+    from . import issuers
     rows = _rows(conn, """
         WITH buys AS (
-          SELECT DISTINCT ticker, issuer_name, owner_name, trans_date, shares, price, value
+          SELECT DISTINCT ticker, issuer_name, issuer_cik, owner_name, trans_date, shares, price, value
           FROM insider_tx
           WHERE code='P' AND is_derivative=0 AND plan_10b5_1=0 AND ticker<>'' AND trans_date>=?)
-        SELECT ticker, issuer_name, COUNT(DISTINCT owner_name) AS insiders,
+        SELECT ticker, issuer_name, MAX(issuer_cik) AS issuer_cik, COUNT(DISTINCT owner_name) AS insiders,
                SUM(value) AS total_value, MIN(trans_date) AS first_buy, MAX(trans_date) AS last_buy,
                GROUP_CONCAT(DISTINCT owner_name) AS who
         FROM buys GROUP BY ticker HAVING insiders >= ?
@@ -132,26 +201,49 @@ def cluster_buys(conn, since: str, min_insiders: int = 2):
     found, bought = {}, {}
     for r in _rows(conn, """
             SELECT DISTINCT ticker, owner_name, relationship, is_director, is_officer, is_ten_pct,
-                   security, direct_indirect, trans_date, shares, shares_after, accession, filed_date
+                   security, direct_indirect, trans_date, shares, shares_after, accession, filed_date, price,
+                   issuer_cik, owner_cik
             FROM insider_tx
             WHERE code='P' AND is_derivative=0 AND plan_10b5_1=0 AND ticker<>'' AND trans_date>=?""",
             (since,)):
         found.setdefault(r["ticker"], set()).update(
             roles(r["relationship"], r["is_director"], r["is_officer"], r["is_ten_pct"]))
         bought.setdefault(r["ticker"], {}).setdefault(r["owner_name"], []).append(r)
+    from . import earnings
+    kinds = issuers.get_many(conn, [r["issuer_cik"] for r in rows])
+    months = purchase_months(conn, [r["issuer_cik"] for r in rows])
+    reports = earnings.dates_many(conn, [r["issuer_cik"] for r in rows])
+    start = data_start(conn)
+    out = []
     for row in rows:  # bare-comma list, like GROUP_CONCAT's `who`, so the filter can pick one role
+        buys = [b for ts in bought.get(row["ticker"], {}).values() for b in ts]
+        types = set()
+        for ts in bought.get(row["ticker"], {}).values():
+            first = min(ts, key=lambda b: b["trans_date"])  # their first purchase in the window decides
+            who = (first["owner_cik"] or "").split(";")[0].strip().lstrip("0")
+            types.add(buyer_type(months.get((first["issuer_cik"], who), set()), first["trans_date"], start))
+        row["buyers"] = ",".join(k for k in BUYER_ORDER if k in types)
+        # where in the quarter the buying began: days since the company's last results
+        row["quarter_timing"] = earnings.timing(earnings.days_since_results(
+            reports.get(str(int(row["issuer_cik"] or 0)), []), row["first_buy"]))
+        info = kinds.get(str(int(row["issuer_cik"] or 0)))
+        row["flags"] = noise_flags(issuers.is_fund(info, row["ticker"]), buys, row["buyers"],
+                                   bool(info and info.get("sic") == REIT_SIC))
+        if hide_noise and row["flags"]:
+            continue
         row["roles"] = ",".join(t for t in ROLE_ORDER if t in found.get(row["ticker"], ()))
         stakes = [s for s in (insider_stake(conn, ts) for ts in bought.get(row["ticker"], {}).values())
                   if s is not None]
         row["max_stake_change"] = max(stakes) if stakes else None
-    return rows
+        out.append(row)
+    return out
 
 
 BREADTH_MIN_HOLDERS = 20  # fund_breadth needs this many holders now...
 BREADTH_MIN_BEFORE = 10   # ...and this many the quarter before (else it's a new listing, or too few)
 
 
-def fund_overlap(conn, since: str, min_insiders: int = 1, min_net_funds: int = 1):
+def fund_overlap(conn, since: str, min_insiders: int = 1, min_net_funds: int = 1, hide_noise: int = 1):
     """Stocks insiders bought in the window that institutions were also net buying in the latest
     13F quarter (funds.py): more managers opened or added (>5%) than cut or exited. Same rows and
     columns as cluster_buys, plus the fund columns. Empty until the 13F data sets are loaded."""
@@ -166,7 +258,7 @@ def fund_overlap(conn, since: str, min_insiders: int = 1, min_net_funds: int = 1
             alias.setdefault(c, f)
     tracked = funds.tracked_by_cusip(conn, meta["period"])
     out = []
-    for r in cluster_buys(conn, since, min_insiders):
+    for r in cluster_buys(conn, since, min_insiders, hide_noise):
         f = next((alias[c] for c in [r["ticker"], *prices.candidates(r["ticker"])] if c in alias), None)
         if not f:
             continue

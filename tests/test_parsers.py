@@ -16,7 +16,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from insider_tracker import alerts, chart, config, cusip_map, db, edgar_13f, edgar_form4, house, jobs, net, funds, news, prices, profiles, quotes, report, senate, signals, tone, ui  # noqa: E402
+from insider_tracker import alerts, chart, config, cusip_map, db, edgar_13f, edgar_form4, house, jobs, net, earnings, funds, news, prices, profiles, quotes, report, senate, signals, tone, ui  # noqa: E402
 
 # These tests are offline. Rendering the cluster table would otherwise start a real background
 # fetch from Yahoo and the SEC (and hold the temp database open while it runs).
@@ -24,6 +24,12 @@ quotes.refresh_in_background = lambda db_path, tickers: False
 prices.refresh_in_background = lambda db_path, tickers: False
 news.refresh_in_background = lambda db_path, tickers: False
 news.safe_ensure = lambda db_path, ticker: None
+from insider_tracker import issuers  # noqa: E402
+issuers.refresh_in_background = lambda db_path, ciks: False
+from insider_tracker import backtest as _bt  # noqa: E402
+_bt.refresh_in_background = lambda db_path: False
+from insider_tracker import earnings as _earn  # noqa: E402
+_earn.refresh_in_background = lambda db_path, ciks: False
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LDQUO, RDQUO = chr(0x201C), chr(0x201D)   # the curly quotes in UUU's footnote
@@ -144,8 +150,10 @@ def test_pipeline():
     with tempfile.TemporaryDirectory() as tmp:
         conn = db.connect(Path(tmp) / "t.db")
         f4 = test_form4()
-        # second insider buying the same ticker -> cluster
-        f4b = [dict(r, accession="0001234567-26-000002", owner_name="Roe Rick", owner_cik="2")
+        # second insider buying the same ticker -> cluster (at his own price: two insiders at one
+        # identical price on one day is a placement, and the noise filter would rightly hide it)
+        f4b = [dict(r, accession="0001234567-26-000002", owner_name="Roe Rick", owner_cik="2",
+                    price=r["price"] + 0.25, value=r["shares"] * (r["price"] + 0.25))
                for r in f4 if r["code"] == "P"]
         db.insert_rows(conn, "insider_tx", f4 + f4b)
         # amendment duplicate should not double count
@@ -163,7 +171,8 @@ def test_pipeline():
         since = (dt.date.today() - dt.timedelta(days=60)).isoformat()
         cb = signals.cluster_buys(conn, since)
         assert cb and cb[0]["ticker"] == "ACME" and cb[0]["insiders"] == 2
-        assert cb[0]["total_value"] == 850000.0, "4/A duplicate must not double-count"
+        bought = sum(r["value"] for r in f4 + f4b if r["code"] == "P")
+        assert cb[0]["total_value"] == bought, "4/A duplicate must not double-count"
         assert signals.overlap(conn, since)[0]["ticker"] == "ACME"
         late = signals.congress_late(conn, since)
         assert late and late[0]["ticker"] == "NVDA" and late[0]["lag_days"] == 73
@@ -616,6 +625,54 @@ def test_jobs_records_errors_without_crashing():
             jobs._jobs.pop("senate", None)
 
 
+def test_jobs_last_run_survives_a_restart():
+    """Each source's last finished run is saved in the database and comes back when the UI starts
+    again -- including runs from the command line (a scheduled update shows up too)."""
+    from insider_tracker import cli
+    import io
+    old = dict(jobs._RUNNERS)
+    jobs._RUNNERS["senate"] = lambda conn, params: "stored 3 transactions"
+    with jobs._lock:
+        jobs._jobs.pop("senate", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.connect(db_path).close()
+            assert jobs.start("senate", db_path)
+            deadline = time.monotonic() + 5
+            while jobs.status("senate")["status"] != "ok" and time.monotonic() < deadline:
+                time.sleep(0.02)
+            _wait_job_threads()
+            finished = jobs.status("senate")["finished_at"]
+            with jobs._lock:  # a restart: the in-memory state is gone
+                jobs._jobs.clear()
+            assert jobs.status("senate")["status"] == "idle"
+            jobs.load_history(db_path)
+            back = jobs.status("senate")
+            assert (back["status"], back["finished_at"], back["message"]) == ("ok", finished, "stored 3 transactions")
+            assert "stored 3 transactions" in ui.page_jobs({})
+
+            # a command-line run is recorded as well, failures included
+            saved = cli.cmd_senate
+            cli.cmd_senate = lambda args, conn: (_ for _ in ()).throw(SystemExit("Senate site is down"))
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    cli.main(["--db", str(db_path), "senate"])
+            except SystemExit:
+                pass
+            finally:
+                cli.cmd_senate = saved
+            with jobs._lock:
+                jobs._jobs.clear()
+            jobs.load_history(db_path)
+            assert jobs.status("senate")["status"] == "error" and "Senate site is down" in jobs.status("senate")["error"]
+    finally:
+        jobs._RUNNERS.clear()
+        jobs._RUNNERS.update(old)
+        with jobs._lock:
+            jobs._jobs.clear()
+
+
 def test_jobs_update_reports_each_source_on_its_own_row():
     """Update runs Form 4 for all issuers, and each source's own row moves
     queued -> running -> ok/skipped/error with its own times and result."""
@@ -776,7 +833,8 @@ def _trade(acc, ticker="ACME", who="Ann", cik="0000000001", day="2026-10-13", fi
 
 
 def _alert_cfg(**rule_over):
-    cfg = {"settings": dict(alerts.SETTINGS_DEFAULTS), "rules": []}
+    # these tests are about the rules; the noise filters have their own test
+    cfg = {"settings": {**alerts.SETTINGS_DEFAULTS, "skip_lockstep": False}, "rules": []}
     for rtype, name in (("cluster_buy", "Cluster"), ("large_buy", "Large")):
         r = {**alerts.RULE_DEFAULTS[rtype], "name": name, "type": rtype, "tickers": [], "exclude_tickers": [],
              "webhook_env": "DISCORD_WEBHOOK_URL"}
@@ -1141,10 +1199,10 @@ def test_cluster_roles_from_free_text_titles():
                    is_officer=0, is_ten_pct=1),
             _trade("r6", who="Fay", cik="6", ticker="OTHR", issuer_cik="9", relationship="CEO", code="A")])
         conn.commit()
-        got = {r["ticker"]: r["roles"] for r in signals.cluster_buys(conn, "2026-10-01")}
+        got = {r["ticker"]: r["roles"] for r in signals.cluster_buys(conn, "2026-10-01", hide_noise=0)}
         assert got == {"ACME": "CEO,CFO,Director", "OTHR": "Director,10% owner"}, got
         # one role picked from the dropdown keeps the clusters that include it
-        page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "sf_roles": ["CEO"]})
+        page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "p_hide_noise": ["0"], "sf_roles": ["CEO"]})
         assert "1 of 2 rows" in page and "CEO &middot; CFO &middot; Director" in page
 
 
@@ -1186,7 +1244,7 @@ def test_stake_change_counts_every_holding_once():
         db.insert_rows(conn, "insider_holdings", [{"accession": "h1", "seq": 0, "security": "Common Stock",
                                                    "shares": 9000.0, "direct_indirect": "D", "nature": None}])
         conn.commit()
-        cb = signals.cluster_buys(conn, "2026-10-01")
+        cb = signals.cluster_buys(conn, "2026-10-01", hide_noise=0)
         assert cb[0]["max_stake_change"] == math.inf, "Bob held nothing; Ann's 9,000 direct shares count"
         lb = {r["owner_name"]: r["stake_change"] for r in signals.large_buys(conn, "2026-10-01", 0)}
         assert lb == {"Ann": 1000 / 9000 * 100, "Bob": math.inf}
@@ -1252,7 +1310,7 @@ def test_quotes_market_cap_and_volume():
         saved = quotes.refresh_in_background
         quotes.refresh_in_background = lambda path, tickers: started.append(list(tickers)) or True
         try:
-            page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"]})
+            page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "p_hide_noise": ["0"]})
         finally:
             quotes.refresh_in_background = saved
         assert ">$2.5B<" in page and ">340.0K<" in page
@@ -1324,7 +1382,7 @@ def test_news_headlines_and_8k_filings():
         news.fetch_many(conn, ["DOWN"], yahoo_http=Http(requests.ConnectionError("down")), sec_http=sec, now=t0)
         assert conn.execute("select status from news_meta where ticker='DOWN'").fetchone()[0] == "error"
 
-        page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"]})
+        page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "p_hide_noise": ["0"]})
         cell = re.search(r"<details><summary>(.*?)</summary>(.*?)</details>", page, re.S)
         assert cell and "3 items &middot; 2 before &middot; 1 8-K" in cell.group(1)
         assert "&lt;b&gt;ACME&lt;/b&gt; soars" in cell.group(2) and "<b>ACME</b>" not in page, "titles are escaped"
@@ -1412,11 +1470,11 @@ def test_tone_tab_tunes_settings_and_labels():
                                   ("2026-10-03T14:00+00:00", "Acme shares plummet", "https://n.example/2"),
                                   ("2026-10-14T14:00+00:00", "Acme shares soar", "https://n.example/3")])
                 conn.commit()
-                page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"]})
+                page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "p_hide_noise": ["0"]})
                 assert re.search(r">negative <span[^>]*>-0\.\d\d &middot; 2<", page), \
                     "the two headlines before the first buy; the later 'soar' isn't counted"
                 assert "tone -0." in page, "each headline in the news list shows its score"
-                filtered = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"],
+                filtered = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "p_hide_noise": ["0"],
                                                   "sf_news_tone": ["negative"]})
                 assert "1 of 1 rows" in filtered
 
@@ -1477,7 +1535,7 @@ def test_sparkline_column_shows_the_last_30_days():
         saved = prices.refresh_in_background
         prices.refresh_in_background = lambda path, tickers: started.append(list(tickers)) or True
         try:
-            page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "sort": ["last_30d"],
+            page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "p_hide_noise": ["0"], "sort": ["last_30d"],
                                           "dir": ["desc"]})
         finally:
             prices.refresh_in_background = saved
@@ -1689,8 +1747,301 @@ def test_backtest_replays_clusters_from_when_they_were_public():
                                       "who": "1", "value": 1}], 2) == []
 
         page = ui.page_signals(conn, {"view": ["backtest"]})
-        assert "Clusters since 2026-10-02" in page and ">+20.0%<" in page and "too few to read" in page
-        assert ">2 insiders<" in page, "the by-kind table"
+        assert "clusters since 2026-10-02" in page and ">+20.0%<" in page and "too few to read" in page
+        assert ">all clusters<" in page and "check on this" in page, "the factor and period tables"
+
+
+def test_noise_filters_drop_funds_and_lockstep_buys():
+    """About a third of real 'clusters' were a fund's directors, or everyone at one price on one day
+    (IPO allocations, placements, purchase plans). They're flagged, hidden by default, and skipped by
+    the Discord bot and the backtest."""
+    fund_doc = {"sic": "", "entityType": "other", "filings": {"recent": {"form": ["N-CSR", "N-2", "4", "N-CSRS"]}}}
+    reit_doc = {"sic": "6798", "sicDescription": "Real Estate Investment Trusts", "entityType": "operating",
+                "filings": {"recent": {"form": ["10-K", "10-Q", "4"]}}}
+    bdc_doc = {"sic": "", "entityType": "operating", "filings": {"recent": {"form": ["10-K", "10-Q", "N-2"]}}}
+    company_doc = {"sic": "3674", "sicDescription": "Semiconductors", "entityType": "operating",
+                   "filings": {"recent": {"form": ["10-K", "10-Q", "4"]}}}
+    assert issuers.classify(fund_doc)["is_fund"] == 1
+    zero_sic = {"sic": "0000", "entityType": "other",
+                "filings": {"recent": {"form": ["3", "40-17F2", "4", "N-Q", "NPORT-P", "N-PX"]}}}
+    assert issuers.classify(zero_sic)["is_fund"] == 1, "SIC 0000 is no industry code; NPORT/N-Q/N-PX are fund forms"
+    assert issuers.classify(reit_doc)["is_fund"] == 0, "'Trust' in a REIT's name doesn't make it a fund"
+    assert issuers.classify(bdc_doc)["is_fund"] == 0, "files 10-Ks like a company: kept"
+    assert issuers.is_fund(None, "PMPEX") and not issuers.is_fund(None, "ACME"), "unknown: mutual-fund style tickers"
+    assert signals.lockstep([{"owner_name": "A", "trans_date": "d", "price": 10.0},
+                             {"owner_name": "B", "trans_date": "d", "price": 10.0}])
+    assert not signals.lockstep([{"owner_name": "A", "trans_date": "d", "price": 10.0},
+                                 {"owner_name": "B", "trans_date": "d", "price": 10.02}])
+    assert not signals.lockstep([{"owner_name": "A", "trans_date": "d", "price": 10.0}]), "one person is not lockstep"
+
+    class Sec:
+        def __init__(self):
+            self.calls = []
+        def get(self, url, **kw):
+            self.calls.append(url)
+            if "CIK0000000777" in url:
+                return _Resp(200, fund_doc)
+            return _Resp(200, reit_doc if "CIK0000000666" in url else company_doc)
+
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [
+            _trade("f1", ticker="FUNDX", issuer_cik="777", who="Ann", cik="1", price=10.0, shares=30000),    # a fund
+            _trade("f2", ticker="FUNDX", issuer_cik="777", who="Bob", cik="2", price=10.5, shares=30000),
+            _trade("l1", ticker="IPO", issuer_cik="888", who="Cy", cik="3", price=12.0, shares=30000),       # lockstep
+            _trade("l2", ticker="IPO", issuer_cik="888", who="Di", cik="4", price=12.0, shares=30000),
+            _trade("r1", ticker="REAL", issuer_cik="999", who="Ed", cik="5", price=30.0, shares=10000),      # genuine
+            _trade("r2", ticker="REAL", issuer_cik="999", who="Fay", cik="6", price=30.4, shares=10000, day="2026-10-14"),
+            _trade("t1", ticker="RENT", issuer_cik="666", who="Gus", cik="7", price=20.0, shares=20000),   # a REIT
+            _trade("t2", ticker="RENT", issuer_cik="666", who="Hal", cik="8", price=20.3, shares=20000, day="2026-10-14")])
+        conn.commit()
+        sec = Sec()
+        assert issuers.fill_buyers(conn, http=sec, since="2026-01-01") == 4 and len(sec.calls) == 4
+        assert issuers.fill_buyers(conn, http=sec, since="2026-01-01") == 0, "cached: not asked again"
+
+        everything = {r["ticker"]: r["flags"] for r in signals.cluster_buys(conn, "2026-10-01", hide_noise=0)}
+        assert everything == {"FUNDX": "fund", "IPO": "lockstep", "REAL": "", "RENT": "reit"}
+        assert [r["ticker"] for r in signals.cluster_buys(conn, "2026-10-01")] == ["REAL"], "hidden by default"
+        page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "p_hide_noise": ["0"]})
+        assert ">lockstep<" in page and ">fund<" in page
+
+        cfg = _alert_cfg()
+        cfg["settings"]["skip_lockstep"] = True
+        found, _ = alerts.evaluate(conn, cfg, ALERT_DAY, lambda r, fp: False)
+        assert sorted(a["ticker"] for a in found if a["rule"] == "Cluster") == ["REAL"], \
+            "the bot skips the fund, the lockstep cluster and the REIT"
+        cfg["settings"]["skip_reits"] = False
+        found, _ = alerts.evaluate(conn, cfg, ALERT_DAY, lambda r, fp: False)
+        assert sorted(a["ticker"] for a in found if a["rule"] == "Cluster") == ["REAL", "RENT"]
+
+
+def _form345_zip(path, subs, owners, trans, notes=(), holds=()):
+    """An invented SEC insider data set quarter."""
+    import zipfile
+    tsv = lambda head, body: "\t".join(head) + "\n" + "".join("\t".join(map(str, r)) + "\n" for r in body)
+    tx_head = ["ACCESSION_NUMBER", "NONDERIV_TRANS_SK", "SECURITY_TITLE", "TRANS_DATE", "TRANS_CODE", "TRANS_SHARES",
+               "TRANS_PRICEPERSHARE", "TRANS_PRICEPERSHARE_FN", "TRANS_ACQUIRED_DISP_CD", "SHRS_OWND_FOLWNG_TRANS",
+               "DIRECT_INDIRECT_OWNERSHIP"]
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("SUBMISSION.tsv", tsv(["ACCESSION_NUMBER", "FILING_DATE", "DOCUMENT_TYPE", "ISSUERCIK", "ISSUERNAME",
+                                          "ISSUERTRADINGSYMBOL", "AFF10B5ONE"], subs))
+        z.writestr("REPORTINGOWNER.tsv", tsv(["ACCESSION_NUMBER", "RPTOWNERCIK", "RPTOWNERNAME", "RPTOWNER_RELATIONSHIP",
+                                              "RPTOWNER_TITLE", "RPTOWNER_TXT"], owners))
+        z.writestr("NONDERIV_TRANS.tsv", tsv(tx_head, trans))
+        z.writestr("FOOTNOTES.tsv", tsv(["ACCESSION_NUMBER", "FOOTNOTE_ID", "FOOTNOTE_TXT"], notes))
+        z.writestr("NONDERIV_HOLDING.tsv", tsv(["ACCESSION_NUMBER", "NONDERIV_HOLDING_SK", "SECURITY_TITLE",
+                                                "SHRS_OWND_FOLWNG_TRANS", "DIRECT_INDIRECT_OWNERSHIP"], holds))
+
+
+def test_insider_history_loads_like_the_live_parser():
+    from insider_tracker import form345
+    with tempfile.TemporaryDirectory() as tmp:
+        q = Path(tmp) / "2019q2_form345.zip"
+        T = lambda acc, sk, code, day, shares, price, fn="": (acc, sk, "Common Stock", day, code, shares, price, fn,
+                                                              "A", shares * 3, "D")
+        _form345_zip(q,
+                     [("a1", "15-MAY-2019", "4", "0000000777", "Acme Corp", "acme", "0"),
+                      ("a2", "16-MAY-2019", "4", "0000000777", "Acme Corp", "ACME", "1"),     # 10b5-1 checkbox
+                      ("a3", "17-MAY-2019", "4", "0000000777", "Acme Corp", "ACME", ""),      # footnote says plan
+                      ("a4", "17-MAY-2019", "4", "0000000777", "Acme Corp", "NONE", "0"),
+                      ("live", "17-MAY-2019", "4", "0000000777", "Acme Corp", "ACME", "0")],
+                     [("a1", "0000000011", "Ann", "Director,Officer", "Chief Executive Officer", ""),
+                      ("a2", "0000000012", "Bob", "TenPercentOwner", "", ""),
+                      ("a3", "0000000013", "Cy", "Other", "", "Trustee"),
+                      ("a4", "0000000014", "Di", "Director", "", ""),
+                      ("live", "0000000015", "Ed", "Director", "", "")],
+                     [T("a1", 1, "P", "13-MAY-2019", 100, 10.5), T("a1", 2, "S", "13-MAY-2019", 50, 11),
+                      T("a1", 3, "P", "13-MAY-2016", 100, 10.0),                              # three years late
+                      T("a1", 4, "P", "13-MAY-0019", 100, 10.0),                              # typo'd year
+                      T("a2", 5, "P", "14-MAY-2019", 200, 10.0), T("a3", 6, "P", "15-MAY-2019", 300, 10.0, "F1"),
+                      T("a4", 7, "P", "15-MAY-2019", 10, 1.0), T("live", 8, "P", "15-MAY-2019", 10, 1.0)],
+                     notes=[("a3", "F1", "Purchased under a Rule 10b5-1 trading plan adopted in March.")],
+                     holds=[("a1", 1, "Common Stock", 5000, "I")])
+        tx, holds = form345.parse(q, skip={"live"})
+        got = {(r["accession"], r["shares"]): r for r in tx}
+        assert sorted(got) == [("a1", 100.0), ("a2", 200.0), ("a3", 300.0), ("a4", 10.0)], \
+            "purchases only; late, typo'd and already-ingested filings left out"
+        a1 = got[("a1", 100.0)]
+        assert (a1["ticker"], a1["issuer_cik"], a1["filed_date"], a1["trans_date"]) == ("ACME", "777", "2019-05-15", "2019-05-13")
+        assert (a1["is_director"], a1["is_officer"], a1["relationship"]) == (1, 1, "Director, Chief Executive Officer")
+        assert a1["value"] == 1050.0 and a1["plan_10b5_1"] == 0 and a1["url"].endswith("/a1-index.htm")
+        assert got[("a2", 200.0)]["plan_10b5_1"] == 1 and got[("a2", 200.0)]["is_ten_pct"] == 1
+        assert got[("a3", 300.0)]["plan_10b5_1"] == 1, "a cited footnote mentioning 10b5-1"
+        assert got[("a4", 10.0)]["ticker"] == "" and holds == [{"accession": "a1", "seq": 0, "security": "Common Stock",
+                                                                "shares": 5000.0, "direct_indirect": "I", "nature": None}]
+        with _tmpdb() as conn:
+            assert form345.load_quarter(conn, q, "2019q2") == 5
+            assert form345.load_quarter(conn, q, "2019q2") == 0, "loading a quarter twice adds nothing"
+            assert "2019q2" in db.processed_ids(conn, "form345")
+
+
+def test_buyer_types_judge_each_insider_by_their_own_past():
+    t = signals.buyer_type
+    every_march = {"2016-03", "2017-03", "2018-03"}
+    assert t(every_march, "2019-03-12", "2015-01-02") == "routine"
+    assert t(set(), "2019-03-12", "2015-01-02") == "first buy"
+    assert t({"2016-01"}, "2019-03-12", "2015-01-02") == "first buy", "older than three years doesn't count"
+    assert t({"2017-08"}, "2019-03-12", "2015-01-02") == "occasional"
+    assert t({"2019-03"}, "2019-03-12", "2015-01-02") == "first buy", "earlier buys the same month don't count"
+    assert t(every_march, "2017-03-12", "2015-01-02") == "unknown", "the data doesn't reach three years back"
+
+
+def test_backtest_history_is_stored_once_and_recent_clusters_stay_live():
+    """refresh() fetches each ticker's history and stores final results; events() reads those and
+    recomputes recent clusters live. Every factor is as it stood at entry."""
+    from insider_tracker import backtest
+    day = lambda d: dt.date(2020, 1, 1) + dt.timedelta(days=d)
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [
+            # 2017 history so buyer types can be judged in 2020; Ann bought every January
+            *[_trade(f"h{y}", who="Ann", cik="1", day=f"{y}-01-10", filed=f"{y}-01-11", price=40.0 + y % 7)
+              for y in (2015, 2016, 2017, 2018, 2019)],
+            _trade("c1", who="Ann", cik="1", day="2020-01-10", filed="2020-01-13", price=50.0),
+            _trade("c2", who="Bob", cik="2", day="2020-01-14", filed="2020-01-15", price=51.0,
+                   relationship="Chief Financial Officer"),
+            _trade("c3", who="Cy", cik="3", day="2020-01-20", filed="2020-01-27", price=52.0)])
+        conn.commit()
+        bars = [{"date": day(d).isoformat(), "open": 50.0 + d * 0.1, "high": 1, "low": 1, "close": 50.0 + d * 0.1,
+                 "adj_close": 1, "volume": 1000} for d in range(-60, 400) if day(d).weekday() < 5]
+        flat = [dict(b, open=100.0, close=100.0) for b in bars]
+
+        class Yahoo:
+            def __init__(self):
+                self.asked = []
+            def get(self, url, params=None, **kw):
+                sym = url.rsplit("/", 1)[-1]
+                self.asked.append(sym)
+                series = flat if sym in ("SPY", "IWM") else bars if sym == "ACME" else None
+                if series is None:
+                    return _Resp(404, None)
+                ts = [int(dt.datetime.fromisoformat(b["date"]).replace(tzinfo=dt.timezone.utc).timestamp()) + 50400
+                      for b in series]
+                q = {k: [b[k] for b in series] for k in ("open", "high", "low", "close", "volume")}
+                return _Resp(200, {"chart": {"result": [{"meta": {"gmtoffset": -18000}, "timestamp": ts,
+                                                         "indicators": {"quote": [q], "adjclose": [{"adjclose": q["close"]}]}}],
+                                             "error": None}})
+
+        y = Yahoo()
+        r = backtest.refresh(conn, http=y, sec_http=y, today="2021-06-30")
+        assert r["events"] == 2 and "ACME" in y.asked, "level 2 and level 3, stored separately"
+        two = backtest.stored_events(conn, 2)[0]
+        three = backtest.stored_events(conn, 3)[0]
+        assert (two["known_on"], two["entry_date"]) == ("2020-01-15", "2020-01-16"), "the second insider's filing"
+        assert (three["known_on"], three["entry_date"]) == ("2020-01-27", "2020-01-28"), "the third's: entered later"
+        assert two["buyers"] == "first buy,routine" and two["top_exec"] == 1, "Bob, a first-time CFO; Ann, routine"
+        assert abs(two["_x60_IWM"] - two["ret_60d"]) < 1e-9, "a flat benchmark: excess equals the return"
+        assert two["prior_30d"] > 0 and two["dollar_volume"] > 0
+        assert conn.execute("select count(*) from bt_events where final=1").fetchone()[0] == 2
+        y2 = Yahoo()
+        assert backtest.refresh(conn, http=y2, sec_http=y2, today="2021-06-30")["events"] == 0 and "ACME" not in y2.asked, \
+            "settled results aren't fetched again"
+        rows = backtest.events(conn, 2, today="2021-06-30")
+        assert [x["known_on"] for x in rows] == ["2020-01-15"]
+        groups = {g["group"]: g for g in backtest.groups(rows)}
+        assert groups["a first-time buyer among them"]["events"] == 1 and groups["only routine buyers"]["events"] == 0
+        assert {g["group"].split(":")[0] for g in backtest.by_period(rows)} == {"2015-2020 (tune on this)",
+                                                                                 "2021 onwards (check on this)"}
+
+
+def test_cfo_screen_preset_and_backtest_tracking():
+    """The CFO screen is a one-click preset, and the backtest tracks CFO clusters separately --
+    in history, and out of sample from the day the screen was chosen."""
+    from insider_tracker import backtest
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        db.insert_rows(conn, "insider_tx", [
+            _trade("p1", who="Ann", cik="1", relationship="Chief Financial Officer", price=10.0, day="2026-10-01",
+                   filed="2026-10-02"),
+            _trade("p2", who="Bob", cik="2", relationship="Director", is_officer=0, is_director=1, price=10.2,
+                   day="2026-10-02", filed="2026-10-03")])
+        conn.execute("INSERT INTO issuer_info (cik, sic, sic_description, entity_type, is_fund, fetched_at) "
+                     "VALUES ('777', '6798', 'REIT', 'operating', 0, '2026-10-01T00:00:00+00:00')")
+        # a stored result from before roles were recorded
+        old = {"ticker": "ACME", "issuer_name": "ACME Inc", "level": 2, "known_on": "2026-10-03",
+               "first_buy": "2026-10-01", "insiders": 2, "total_value": 1, "buyers": "", "flags": "",
+               "status": "open", "_x60_IWM": 5.0}
+        conn.execute("INSERT INTO bt_events (key, level, known_on, final, data) VALUES (?,?,?,?,?)",
+                     ("ACME|2026-10-03|2", 2, "2026-10-03", 1, json.dumps(old)))
+        conn.commit()
+        assert backtest.annotate(conn) == 1 and backtest.annotate(conn) == 0
+        row = backtest.stored_events(conn, 2, hide_noise=0)[0]
+        assert row["roles"] == "CFO,Director" and row["flags"] == "reit"
+        assert backtest.stored_events(conn, 2) == [], "a REIT is hidden by default"
+        g = {x["group"]: x for x in backtest.groups([row])}
+        assert g["CFO among the buyers"]["events"] == 1 and g["no CFO among the buyers"]["events"] == 0
+        oos = {x["group"]: x for x in backtest.out_of_sample([dict(row, known_on="2027-01-05"), row])}
+        assert oos[f"since {backtest.TRACK_FROM}: CFO among the buyers"]["events"] == 1, \
+            "only clusters after the screen was chosen count as its live test"
+
+        page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["30"]})
+        assert ">CFO buying<" in page and "sf_roles=CFO" in page
+        assert ">CFO buying<" in ui.page_signals(conn, {"view": ["fund_overlap"], "days": ["30"]})
+
+
+def test_earnings_dates_and_quarter_timing():
+    """Earnings dates come from 8-Ks with Item 2.02 (older filings live on extra pages); each
+    cluster says where in the quarter its buying began; the backtest and a preset use it."""
+    from insider_tracker import backtest
+    recent = {"form": ["8-K", "10-Q", "8-K", "8-K", "8-K"],
+              "filingDate": ["2026-08-05", "2026-08-06", "2026-07-01", "2026-05-06", "2026-02-10"],
+              "items": ["2.02,9.01", "", "5.02", "2.02", "2.02,9.01"]}
+    older = {"form": ["8-K", "8-K"], "filingDate": ["2025-11-04", "2013-05-01"], "items": ["2.02", "2.02"]}
+    assert earnings.report_dates(recent) == ["2026-08-05", "2026-05-06", "2026-02-10"], "only Item 2.02"
+    assert [earnings.timing(d) for d in (None, 0, 7, 8, 30, 31, 60, 61, 200)] == [
+        "unknown", "first week after results", "first week after results", "1-4 weeks after results",
+        "1-4 weeks after results", "1-2 months after results", "1-2 months after results",
+        "2+ months after results", "2+ months after results"]
+    reports = ["2025-11-04", "2026-02-10", "2026-05-06", "2026-08-05"]
+    assert earnings.days_since_results(reports, "2026-09-20") == 46
+    assert earnings.days_since_results(reports, "2026-08-05") == 91, "a report that day hasn't happened yet"
+    assert earnings.days_since_results(reports[:3], "2026-09-20") is None, "too few reports to trust"
+
+    class Sec:
+        def __init__(self):
+            self.calls = []
+        def get(self, url, **kw):
+            self.calls.append(url)
+            if url.endswith("CIK0000000777.json"):
+                return _Resp(200, {"filings": {"recent": recent, "files": [{"name": "CIK0000000777-submissions-001.json"}]}})
+            if url.endswith("-001.json"):
+                return _Resp(200, older)
+            return _Resp(404, None)
+
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        sec = Sec()
+        assert earnings.fetch_many(conn, ["777", "888"], http=sec) == 2
+        assert earnings.dates(conn, "777") == reports, "the older page is followed; pre-2014 dropped"
+        assert earnings.dates(conn, "888") == [] and earnings.missing(conn, ["777", "888"]) == []
+        assert earnings.missing(conn, ["777"], now=dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=15)) == ["777"]
+
+        db.insert_rows(conn, "insider_tx", [
+            _trade("m1", who="Ann", cik="1", relationship="Chief Financial Officer", price=10.0,
+                   day="2026-09-20", filed="2026-09-21"),
+            _trade("m2", who="Bob", cik="2", relationship="Director", is_officer=0, is_director=1, price=10.3,
+                   day="2026-09-22", filed="2026-09-23")])
+        conn.commit()
+        row = signals.cluster_buys(conn, "2026-09-01")[0]
+        assert row["quarter_timing"] == "1-2 months after results", "46 days after the 5 Aug report"
+        page = ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["60"]})
+        assert ">CFO mid-quarter<" in page and "sf_quarter_timing=1-2+months+after+results" in page
+        fresh = (dt.date.today() - dt.timedelta(days=5)).isoformat()
+        link = re.search(r'href="([^"]*)"[^>]*>CFO mid-quarter<', page).group(1)
+        assert "days=21" in link and "p_min_insiders=2" in link and f"df_last_buy_from={fresh}" in link, (
+            "the screen's defaults match how the backtest bought: fresh clusters, one bout")
+
+        stored = {"ticker": "ACME", "issuer_name": "ACME Inc", "level": 2, "known_on": "2026-09-23",
+                  "first_buy": "2026-09-20", "insiders": 2, "total_value": 1, "buyers": "", "flags": "",
+                  "roles": "CFO,Director", "status": "open", "_x60_IWM": 4.0}
+        conn.execute("INSERT INTO bt_events (key, level, known_on, final, data) VALUES (?,?,?,?,?)",
+                     ("ACME|2026-09-23|2", 2, "2026-09-23", 1, json.dumps(stored)))
+        conn.commit()
+        assert backtest.annotate(conn) == 1
+        r = backtest.stored_events(conn, 2)[0]
+        assert (r["since_results"], r["quarter_timing"]) == (46, "1-2 months after results")
+        g = {x["group"]: x for x in backtest.groups([r])}
+        assert g["CFO, bought 1-2 months after results"]["events"] == 1
 
 
 def test_ui_sorting():
@@ -1915,7 +2266,7 @@ def test_cluster_buys_filter_by_first_and_last_buy():
         conn.commit()
 
         def page(**q):
-            qs = {"view": ["cluster_buys"], "days": ["3650"], **{k: [v] for k, v in q.items()}}
+            qs = {"view": ["cluster_buys"], "days": ["3650"], "p_hide_noise": ["0"], **{k: [v] for k, v in q.items()}}
             return ui.page_signals(conn, qs)
         tickers = lambda html: sorted(set(re.findall(r'href="/chart\?ticker=(LONG|SHORT)"', html)))
 
@@ -2132,7 +2483,7 @@ def test_ui_chart_page():
         cell, _ = ui._cell("ticker", "HEI, HEI.A")
         assert cell.startswith('<a class="tk" href="/chart?ticker=HEI%2C+HEI.A"')
         assert ui._cell("ticker", "") == ("", "nil")
-        assert 'href="/chart?ticker=EXH"' in ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"]})
+        assert 'href="/chart?ticker=EXH"' in ui.page_signals(conn, {"view": ["cluster_buys"], "days": ["3650"], "p_hide_noise": ["0"]})
         # the chart is part of what Copy PNG draws, and the button is enabled on this page
         assert 'id="copypng"' in html and "svg.chart" in ui.COPY_PNG_JS and "disabled" not in re.search(
             r"<button[^>]*id=\"copypng\"[^>]*>", html).group(0)

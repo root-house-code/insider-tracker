@@ -65,7 +65,31 @@ CREATE TABLE IF NOT EXISTS fund_meta (
   period TEXT PRIMARY KEY, prior_period TEXT, managers INTEGER, managers_prior INTEGER,
   compared INTEGER, loaded_at TEXT
 );
+-- Earnings report dates per company (SEC 8-Ks with Item 2.02), for where-in-the-quarter timing.
+CREATE TABLE IF NOT EXISTS earnings (
+  cik TEXT NOT NULL, report_date TEXT NOT NULL, PRIMARY KEY (cik, report_date)
+);
+CREATE TABLE IF NOT EXISTS earnings_meta (cik TEXT PRIMARY KEY, fetched_at TEXT NOT NULL);
+-- Each Jobs-tab source's last finished run (from the UI or the command line), so it survives restarts.
+CREATE TABLE IF NOT EXISTS job_runs (
+  source TEXT PRIMARY KEY, status TEXT, started_at TEXT, finished_at TEXT, message TEXT
+);
+-- Backtest results for clusters whose returns can no longer change (backtest.py), as JSON rows;
+-- recent clusters are recomputed live instead.
+CREATE TABLE IF NOT EXISTS bt_events (
+  key TEXT PRIMARY KEY, level INTEGER NOT NULL, known_on TEXT NOT NULL,
+  final INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_bt_level ON bt_events(level, known_on);
+CREATE TABLE IF NOT EXISTS bt_meta (name TEXT PRIMARY KEY, value TEXT);
+-- Operating company or fund, from each issuer's SEC record (issuers.py).
+CREATE TABLE IF NOT EXISTS issuer_info (
+  cik TEXT PRIMARY KEY, sic TEXT, sic_description TEXT, entity_type TEXT,
+  is_fund INTEGER NOT NULL DEFAULT 0, fetched_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS ix_insider_date ON insider_tx(trans_date);
+-- per-company history lookups (routine buyers, backtest) over years of purchases
+CREATE INDEX IF NOT EXISTS ix_insider_issuer ON insider_tx(issuer_cik, code);
 CREATE INDEX IF NOT EXISTS ix_insider_ticker ON insider_tx(ticker);
 CREATE INDEX IF NOT EXISTS ix_insider_code ON insider_tx(code);
 
@@ -138,7 +162,9 @@ CREATE TABLE IF NOT EXISTS cusip_ticker (
 def connect(path=None) -> sqlite3.Connection:
     path = Path(path or DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # Several writers can be busy at once (the UI's background fills, a long backtest or ingest):
+    # wait up to 30 s for a lock rather than SQLite's default 5 s before giving up.
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)

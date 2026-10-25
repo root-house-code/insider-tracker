@@ -55,6 +55,7 @@ RULE_DEFAULTS = {
                   "cooldown_days": 7},
 }
 SETTINGS_DEFAULTS = {"max_age_days": 4, "max_filing_value": 1_000_000_000,
+                     "skip_funds": True, "skip_lockstep": True, "skip_reits": True,
                      "footer": "Not investment advice.", "webhook_env": "DISCORD_WEBHOOK_URL",
                      "username": "insider-tracker"}
 ROLES = {"officer": "is_officer", "director": "is_director", "ten_pct": "is_ten_pct"}
@@ -253,6 +254,14 @@ def evaluate(conn, cfg, today: dt.date, is_notified, last_posted=lambda rule, gr
     trades, skipped = load_trades(conn, (today - dt.timedelta(days=longest)).isoformat(),
                                   today.isoformat(), s["max_filing_value"])
     is_new = lambda rule, t: t["filed_date"] >= fresh_from and not is_notified(rule["name"], t["fp"])
+    if s.get("skip_funds", True) or s.get("skip_reits", True):
+        from . import issuers
+        kinds = issuers.get_many(conn, {t["issuer_cik"] for t in trades})
+        info = lambda t: kinds.get(str(int(t["issuer_cik"] or 0)))
+        if s.get("skip_funds", True):  # a fund's directors buying its shares is routine, not a signal
+            trades = [t for t in trades if not issuers.is_fund(info(t), t["ticker"])]
+        if s.get("skip_reits", True):  # REIT clusters trailed small caps in both backtest periods
+            trades = [t for t in trades if (info(t) or {}).get("sic") != signals.REIT_SIC]
     alerts = []
     for rule in cfg["rules"]:
         since = (today - dt.timedelta(days=rule["window_days"])).isoformat()
@@ -267,6 +276,8 @@ def evaluate(conn, cfg, today: dt.date, is_notified, last_posted=lambda rule, gr
                 if len(ins) < rule["min_insiders"] or total < rule["min_total_value"]:
                     continue
                 members = [t for i in ins for t in i["trades"]]
+                if s.get("skip_lockstep", True) and signals.lockstep(members):
+                    continue  # everyone at one price on one day: an IPO or placement, not a cluster
                 new = [t for t in members if is_new(rule, t)]
                 if new:
                     alerts.append(_alert(rule, members, ins, new, total, issuer, today, last_posted, is_notified))

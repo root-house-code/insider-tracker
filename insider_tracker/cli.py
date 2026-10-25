@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 
-from . import alerts, config, db, edgar_13f, edgar_form4, funds, house, report, senate, ui
+from . import alerts, config, db, edgar_13f, edgar_form4, form345, funds, house, jobs, report, senate, ui
 from .edgar_common import tickers_to_ciks
 from .net import PoliteSession
 
@@ -51,6 +51,12 @@ def cmd_13f(args, conn):
         sys.exit("No 13F managers given. Use --managers CIK,CIK or add managers_13f to watchlist.json")
     n = edgar_13f.ingest(conn, _sec(), managers, quarters=args.quarters)
     print(f"13F: stored {n} positions for {len(managers)} managers")
+
+
+def cmd_history(args, conn):
+    r = form345.ingest(conn, since_year=args.since)
+    print(f"Insider history: {r['quarters']} quarter(s) loaded, {r['purchases']:,} purchases; "
+          f"earliest trade {r['earliest']}")
 
 
 def cmd_funds(args, conn):
@@ -173,6 +179,10 @@ def main(argv=None):
     s.add_argument("--quarters", type=int, default=4)
     s.set_defaults(fn=cmd_13f)
 
+    s = sub.add_parser("history", help="Load years of insider purchases from the SEC's quarterly data sets")
+    s.add_argument("--since", type=int, default=2015, help="first year to load (data starts in 2006)")
+    s.set_defaults(fn=cmd_history)
+
     s = sub.add_parser("funds", help="Load every 13F filer's latest quarter from the SEC's bulk data sets")
     s.set_defaults(fn=cmd_funds)
 
@@ -205,7 +215,22 @@ def main(argv=None):
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     conn = db.connect(args.db)
+    started = dt.datetime.now().isoformat(timespec="seconds")
+    outcome = ("error", "stopped")
     try:
         args.fn(args, conn)
+        outcome = ("ok", "run from the command line")
+    except SystemExit as exc:
+        outcome = ("error", f"command line: {exc}") if exc.code not in (None, 0) else ("ok", "run from the command line")
+        raise
+    except Exception as exc:
+        outcome = ("error", f"command line: {type(exc).__name__}: {exc}"[:500])
+        raise
     finally:
+        if args.cmd in jobs.SOURCES:  # so the Jobs tab shows scheduled runs too
+            try:
+                jobs.record(conn, args.cmd, outcome[0], started, dt.datetime.now().isoformat(timespec="seconds"),
+                            outcome[1])
+            except Exception:
+                pass
         conn.close()

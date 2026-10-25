@@ -45,6 +45,34 @@ A plain HTML UI over the same database.
   make a cluster, and the page re-queries. Every view exports CSV. Insider cluster buys
   also has date ranges for **first buy** and **last buy** (for example "last buy since
   Oct 1" = still active), separate from the window, which decides which purchases count.
+- **Noise filters** (cluster, fund overlap and backtest views, and the Discord bot). About a third
+  of raw "clusters" aren't discretionary buying; they're flagged and hidden by default:
+  - **fund:** the issuer is a closed-end or interval fund, according to its SEC record. Its
+    directors buy routinely.
+  - **lockstep:** every insider paid the identical price on the same day: an IPO allocation, a
+    placement or a purchase plan.
+
+  - **routine:** every buyer bought in the same month each of the last three years.
+  - **reit:** a real estate investment trust. REIT clusters trailed small caps in both halves of the
+    2015-2026 backtest.
+
+  Set **hide noise** to 0 to see them with the reason in **flags**. The bot's `skip_funds` and
+  `skip_lockstep` settings do the same there.
+- **CFO buying** (a preset on the cluster and fund overlap views). In the 2015-2026 backtest,
+  clusters with the CFO among the buyers beat IWM by about 2% on average over three and six months,
+  in both halves of the period. It was the only pattern of 34 tested that held up. Even so, under
+  half of them beat IWM: the edge comes from a minority of big winners, so it only shows up across
+  many such clusters. The backtest tracks the screen out of sample from 2026-10-24, when it was
+  chosen; that's the real test of whether it holds.
+- **CFO mid-quarter** (another preset), plus a **quarter_timing** column. It shows where in the
+  company's quarter the buying began, measured from its last earnings report (SEC 8-K, Item 2.02).
+  - In 2015-2026, CFO clusters bought 1-2 months after results were the only group where more
+    than half beat IWM in both periods (56% and 53%).
+  - Buying close to the next report did worse.
+  - It rests on a few hundred clusters and was found by looking, so the backtest tracks it from
+    2026-10-24.
+
+  Earnings dates are refreshed every two weeks, in the background or by the Backtest job.
 - **Insider cluster buys** columns:
   - **roles:** who bought, most senior first (CEO, CFO, ..., Director, 10% owner), read from
     each filer's free-text title. Filterable, so you can keep just the clusters a CEO joined.
@@ -63,6 +91,13 @@ A plain HTML UI over the same database.
     headlines it rests on. It covers the headlines from the month before the first buy. Scored
     by VADER with finance word weights, so "beats estimates" counts as good, while "cancer",
     "crude" or "shares" count for nothing.
+- **Insider history** - run **History** on the Jobs tab (or `python -m insider_tracker history
+  --since 2015`). It loads every open-market purchase since then from the SEC's quarterly Insider
+  Transactions Data Sets: about 375,000 purchases, a few minutes the first time. Implausible dates
+  (typos, purchases reported years late) are skipped. History powers:
+  - **buyers:** for each insider, whether this purchase was their *first* in three years, a
+    *routine* one (same month each year, little information), or *occasional*;
+  - the backtest below.
 - **Backtest: cluster buys** (a Signals view) - how every cluster has done since it became public.
   - **Entry:** the next open after the filing that made it a cluster. Using trade dates would flatter
     the results.
@@ -71,8 +106,13 @@ A plain HTML UI over the same database.
     and number of insiders. Each figure says how many clusters it rests on and whether that's enough
     to mean anything.
 
-  It recalculates every time you open it, and tops up stale prices in the background, so it stays
-  current as filings arrive. Clusters with no price history (often delisted) drop out and the page
+  With history loaded it covers about 17,000 clusters since 2015. The **Backtest** job (Jobs tab,
+  also started weekly by the view itself) fetches each ticker's price history once and stores only
+  the results; recent clusters are recomputed live, so the view stays current. Its tables show:
+  - which kinds of cluster did better, by what was known at entry: first-time vs routine buyers,
+    CEO/CFO, prior 30-day move, liquidity, dollars bought;
+  - those factors split into 2015-2020 and 2021 onwards, since a factor that only works in one
+    period was probably luck. Clusters with no price history (often delisted) drop out and the page
   says how many, since that flatters the results.
 - **Fund / insider overlap** (a Signals view) - stocks insiders bought that institutions were also net
   buying, across *every* 13F filer rather than a chosen few. It has the cluster columns plus:

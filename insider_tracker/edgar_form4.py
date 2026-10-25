@@ -214,4 +214,6 @@ def ingest(conn, http, start: dt.date, end: dt.date, issuer_ciks: set = None) ->
         conn.commit()
     # purchase filings stored before holdings were parsed: the stake-change math needs them
     backfill_holdings(conn, http, (start - dt.timedelta(days=HOLDINGS_LOOKBACK_DAYS)).isoformat())
+    from . import issuers  # fund or operating company, for the noise filters
+    issuers.fill_buyers(conn, http)
     return stored

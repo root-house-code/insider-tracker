@@ -27,6 +27,18 @@ webhook_env = "DISCORD_WEBHOOK_URL"
 # Name the bot posts under.
 username = "insider-tracker"
 
+# Skip funds (closed-end and interval funds): their directors buy shares routinely. Told apart from
+# companies by the SEC's own record of each issuer, which every Form 4 ingest looks up.
+skip_funds = true
+
+# Skip clusters where every insider paid the identical price on the same day: an IPO allocation, a
+# private placement or a company purchase plan rather than people independently deciding to buy.
+skip_lockstep = true
+
+# Skip real estate investment trusts: in the backtest (2015-2026) their insider clusters trailed
+# small caps in both halves of the period, unlike most kinds of company.
+skip_reits = true
+
 
 # Several different insiders at one company buying within a window: the strongest signal.
 [[rule]]

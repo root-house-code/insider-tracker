@@ -34,7 +34,7 @@ from collections import namedtuple
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import backtest, chart, config, db, funds, jobs, news, prices, profiles, quotes, signals, tone
+from . import background, backtest, chart, config, db, earnings, funds, issuers, jobs, news, prices, profiles, quotes, signals, tone
 from .edgar_common import tickers_to_ciks
 from .net import PoliteSession
 
@@ -272,6 +272,29 @@ COLUMN_HELP = {
                 "change over the period. Did insiders buy into a fall, or chase a rise? Sorts by the "
                 "change. Prices come from Yahoo Finance and are fetched in the background the first "
                 "time a ticker appears; click the ticker for the full chart.",
+    "flags": "Why a cluster is probably not discretionary buying. fund: the issuer is a fund (closed-end "
+             "or interval), per its SEC record -- its directors buy routinely. reit: a real estate investment "
+             "trust -- REIT clusters trailed small caps in both halves of the 2015-2026 backtest. lockstep: every insider paid "
+             "the identical price on the same day -- an IPO allocation, a placement or a purchase plan. "
+             "routine: every buyer bought in this same month each of the last three years -- a habit, "
+             "not news. Hidden unless hide noise is 0. A lockstep flag can catch two directors who genuinely bought "
+             "together, so look before dismissing one.",
+    "buyers": "What kind of buyer each insider was, judged by their own purchases of this stock in the "
+              "three years before: routine (bought in this same month each of the last three years -- "
+              "research finds these carry little information), first buy (none in three years), "
+              "occasional (in between), unknown (the data doesn't reach back three years).",
+    "prior_30d": "The stock's move over the month before entry: insiders buying into a fall, or chasing "
+                 "a rise?",
+    "beat_iwm": "Share of these clusters that beat IWM over the same days.",
+    "avg_vs_iwm": "Average excess return over IWM, leaving out the most extreme 1% at each end. Closest to "
+                  "what holding every one of these clusters equally would have earned. Usually above the "
+                  "median: a minority of big winners lifts the average while the typical cluster lags.",
+    "quarter_timing": "Where in the company's quarter the buying began: days since its last earnings report "
+                      "(SEC 8-K, Item 2.02). Most companies bar insider trading in the weeks before results. "
+                      "In the 2015-2026 backtest, CFO clusters bought 1-2 months after results were the only "
+                      "group where more than half beat small caps in both halves of the period; those bought "
+                      "2+ months after (close to the next report) did worse. unknown: the company doesn't file "
+                      "Item 2.02 8-Ks, or its dates haven't been fetched yet.",
     "known_on": "The filing date of the purchase that made this a cluster (brought in the last insider "
                 "needed): the first day anyone could have known. Trade dates come earlier and would flatter "
                 "the results.",
@@ -368,9 +391,13 @@ VIEWS = [
     _v("cluster_buys", "Insider cluster buys", signals.cluster_buys,
        [Param("min_insiders", "min insiders", 2, int,
               "How many different insiders must buy before a company shows up. Two is the "
-              "usual bar. Raise it to 3 or more to cut the list down to the strongest cases.")],
-       ["ticker", "issuer_name", "last_30d", "insiders", "roles", "max_stake_change", "total_value",
-        "market_cap", "avg_volume", "first_buy", "last_buy", "news", "news_tone", "who"],
+              "usual bar. Raise it to 3 or more to cut the list down to the strongest cases."),
+        Param("hide_noise", "hide noise", 1, int,
+              "1 hides clusters flagged as probably not discretionary buying: a fund's directors (funds "
+              "buy their own shares routinely), or every insider at one price on one day (an IPO "
+              "allocation, placement or purchase plan). 0 shows them, with the reason in flags.")],
+       ["ticker", "issuer_name", "last_30d", "insiders", "roles", "buyers", "flags", "quarter_timing", "max_stake_change",
+        "total_value", "market_cap", "avg_volume", "first_buy", "last_buy", "news", "news_tone", "who"],
        "Two or more insiders at one company buying on the open market (code P), "
        "outside 10b5-1 plans. The strongest signal here.",
        "Several insiders at the same company buying on the open market at the same time. The "
@@ -384,9 +411,13 @@ VIEWS = [
         Param("min_net_funds", "min net funds", 1, int,
               "How many more institutions must have opened or added to a position than cut or closed "
               "one, in the latest 13F quarter. Raise it to keep only stocks institutions were clearly "
-              "accumulating.")],
-       ["ticker", "issuer_name", "last_30d", "insiders", "roles", "max_stake_change", "total_value",
-        "net_funds", "fund_breadth", "funds_new", "funds_added", "funds_cut", "funds_exited", "fund_holders",
+              "accumulating."),
+        Param("hide_noise", "hide noise", 1, int,
+              "1 hides clusters flagged as probably not discretionary buying: a fund's directors (funds "
+              "buy their own shares routinely), or every insider at one price on one day (an IPO "
+              "allocation, placement or purchase plan). 0 shows them, with the reason in flags.")],
+       ["ticker", "issuer_name", "last_30d", "insiders", "roles", "buyers", "flags", "quarter_timing", "max_stake_change",
+        "total_value", "net_funds", "fund_breadth", "funds_new", "funds_added", "funds_cut", "funds_exited", "fund_holders",
         "fund_shares_change", "tracked_funds", "market_cap", "avg_volume", "first_buy", "last_buy",
         "news_tone"],  # no "who" (a 30-name list made rows tall) or "news": both are on Insider cluster buys
        "Stocks insiders bought on the open market (code P, outside 10b5-1 plans) that institutions "
@@ -395,15 +426,22 @@ VIEWS = [
        "to a position than cut or closed one. 13F data is quarterly and lags by months, so read it as "
        "what funds were doing before the insiders bought, not alongside them.",
        date_filters=("first_buy", "last_buy")),
-    _v("backtest", "Backtest: cluster buys", lambda conn, min_insiders=2: backtest.events(conn, min_insiders),
+    _v("backtest", "Backtest: cluster buys", lambda conn, min_insiders=2, hide_noise=1: backtest.events(
+           conn, min(max(min_insiders, backtest.LEVELS[0]), backtest.LEVELS[-1]), hide_noise),
        [Param("min_insiders", "min insiders", 2, int,
-              "How many different insiders make a cluster. A cluster is dated by the filing that "
-              "brought in the last of them -- the first day anyone could have acted on it.")],
-       ["ticker", "issuer_name", "known_on", "entry_date", "insiders", "total_value", "ret_5d", "ret_10d",
-        "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm", "days_held", "market_cap",
-        "status"],
+              "How many different insiders make a cluster: 2, 3 or 4. Each is dated by the filing that "
+              "brought in the last of them -- the first day anyone could have acted on it -- so a 3-insider "
+              "cluster is entered later than the same cluster at 2."),
+        Param("hide_noise", "hide noise", 1, int,
+              "1 hides clusters flagged as probably not discretionary buying: a fund's directors (funds "
+              "buy their own shares routinely), or every insider at one price on one day (an IPO "
+              "allocation, placement or purchase plan). 0 shows them, with the reason in flags.")],
+       ["ticker", "issuer_name", "known_on", "entry_date", "insiders", "buyers", "total_value", "prior_30d",
+        "ret_5d", "ret_10d", "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm", "days_held",
+        "status", "flags"],
        "Every insider cluster buy in the database, replayed as if you had bought at the next open after "
-       "it became public, with its returns since -- against SPY and IWM. Recomputed each time you open it.",
+       "it became public, with its returns since -- against SPY and IWM. Years of history are stored; "
+       "the last few months are recomputed each time you open it.",
        "How the cluster-buy signal has actually done since each cluster became public. Read the summary "
        "first: it says how many clusters each figure rests on and whether that is enough to mean anything.",
        takes_since=False, date_filters=("known_on",)),
@@ -506,9 +544,15 @@ MODULES = [
                        ".txt -> ownershipDocument XML -> insider_tx."),
     ("edgar_13f.py", "13F (institutional holdings). data.sec.gov submissions API -> "
                      "index.json -> info table XML -> holdings_13f."),
-    ("backtest.py", "Replays every insider cluster buy from the day it became public (its filing date) "
-                    "and measures the returns since against SPY and IWM. Recomputed on every view, so "
-                    "it stays current as filings and prices arrive."),
+    ("form345.py", "Years of insider purchases (2015 on by default) from the SEC's quarterly Insider "
+                   "Transactions Data Sets, loaded into the same tables as the live Form 4 ingest. "
+                   "Feeds the backtest and each insider's routine / first-buy history."),
+    ("backtest.py", "Replays every insider cluster from the day it became public, at 2, 3 and 4 "
+                    "insiders, and measures returns against SPY and IWM. Settled history is computed "
+                    "once by the Backtest job and stored; recent clusters are recomputed live."),
+    ("issuers.py", "Operating company or fund, from each issuer's SEC record (funds have no industry code "
+                   "and file N-CSR/N-2 reports). Feeds the noise filters: a fund's directors buying "
+                   "its shares, or every insider at one price on one day, is not a signal."),
     ("funds.py", "Every 13F filer at once, from the SEC's quarterly Form 13F data sets: how many "
                  "institutions opened, added to, cut or closed each stock, quarter on quarter. Stores "
                  "a per-stock summary (fund_flows), not the millions of positions behind it."),
@@ -579,7 +623,7 @@ CODES = {
 }
 TX_TYPES = {"P": "buy", "S": "sell", "E": "exchange"}
 # Columns holding a GROUP_CONCAT list rather than a single value.
-LIST_COLS = {"who", "member_names", "roles", "tracked_funds"}
+LIST_COLS = {"who", "member_names", "roles", "tracked_funds", "flags", "buyers"}
 
 MONEY_COLS = {"value", "total_value", "min_total_usd", "value_now", "value_usd",
               "amount_low", "amount_high", "min_bought_usd", "min_sold_usd"}
@@ -587,8 +631,8 @@ COUNT_COLS = {"net_funds", "funds_new", "funds_added", "funds_cut", "funds_exite
               "shares", "shares_after", "shares_now", "shares_prior", "insiders",
               "members", "buys", "sells", "lag_days", "seq"}
 RATIO_COLS = {"bought_sold_ratio"}
-BACKTEST_PCT = ("ret_5d", "ret_10d", "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm",
-                "median_return", "mean_return", "median_vs_spy", "median_vs_iwm")
+BACKTEST_PCT = ("prior_30d", "beat_iwm", "ret_5d", "ret_10d", "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm",
+                "median_return", "mean_return", "median_vs_spy", "median_vs_iwm", "avg_vs_iwm")
 COMPACT_COLS = {"market_cap": "$", "avg_volume": ""}  # shown as $1.2B / 340K; sorted on the number
 STAKE_COLS = {"stake_change", "max_stake_change"}  # percent; math.inf = a brand-new position
 
@@ -945,7 +989,7 @@ def _cell(col, v):
         return COMPACT_COLS[col] + _compact(v), "num"
     if col in STAKE_COLS and isinstance(v, (int, float)):
         return signals.stake_text(v), "num"
-    if col == "beat_spy" and isinstance(v, (int, float)):
+    if col in ("beat_spy", "beat_iwm") and isinstance(v, (int, float)):
         return f"{v:.0f}%", "num"
     if col in ("pct_change", "fund_shares_change", "fund_breadth") + BACKTEST_PCT and isinstance(v, (int, float)):
         return f"{v:+,.1f}%", "num"
@@ -1345,8 +1389,41 @@ def _add_sparks(conn, rows, fetch=False) -> str:
 
 # One-click screens: a label, the query they set, and what they're for. Each is just a link, so
 # the result can be bookmarked, adjusted with the controls, or shared like any other view.
+CFO_TIP = ("The CFO among the buyers. In the 2015-2026 backtest, clusters with the CFO buying beat small caps "
+           "(IWM) by about 2% on average over the following three and six months, in both halves of the "
+           "period -- the one pattern that held. Still under half of them beat IWM: the edge comes from a "
+           "minority of big winners, so it shows up across many such clusters, not in any one.")
+# The CFO mid-quarter screen shows clusters as the backtest bought them: just after they became
+# public. A 21-day window holds one bout of buying (buys at most 14 days apart) without reaching
+# back into an older one; a buy in the last 5 days means the filing that completed it is fresh.
+FRESH_BUY_DAYS = 5
+
+
+def _days_ago(n):
+    return lambda: (dt.date.today() - dt.timedelta(days=n)).isoformat()
+
+
+CFO_MID_TIP = ("CFO among the buyers, and the buying began one to two months after the company's last earnings "
+               "report (mid-quarter). In the 2015-2026 backtest this was the one group where more than half beat "
+               "small caps (IWM) in both halves of the period. It rests on a few hundred clusters and was found "
+               "by looking, so the backtest tracks it from 2026-10-24 to see whether it holds. Set to show "
+               "only fresh clusters, as the backtest bought them: 2+ insiders within a 21-day window, the latest "
+               "buy in the last 5 days. Buy at the next open; the edge showed up across many such clusters, "
+               "not in any one.")
 PRESETS = {
+    "cluster_buys": [
+        ("CFO mid-quarter", dict(days=21, p_min_insiders=2, p_hide_noise=1, sf_roles="CFO",
+                                 sf_quarter_timing=earnings.MID_QUARTER, df_last_buy_from=_days_ago(FRESH_BUY_DAYS),
+                                 sort="total_value", dir="desc"), CFO_MID_TIP),
+        ("CFO buying", dict(days=30, p_min_insiders=2, p_hide_noise=1, sf_roles="CFO", sort="total_value", dir="desc"),
+         CFO_TIP),
+    ],
     "fund_overlap": [
+        ("CFO mid-quarter", dict(days=21, p_min_insiders=2, p_min_net_funds=1, p_hide_noise=1, sf_roles="CFO",
+                                 sf_quarter_timing=earnings.MID_QUARTER, df_last_buy_from=_days_ago(FRESH_BUY_DAYS),
+                                 sort="fund_breadth", dir="desc"), CFO_MID_TIP),
+        ("CFO buying", dict(days=30, p_min_insiders=1, p_min_net_funds=1, p_hide_noise=1, sf_roles="CFO",
+                            sort="fund_breadth", dir="desc"), CFO_TIP),
         ("Conviction screen", dict(days=30, p_min_insiders=2, p_min_net_funds=1, sort="fund_breadth", dir="desc"),
          "Two or more insiders buying in the last 30 days, in stocks institutions were net buying, ranked by "
          "fund breadth (net buyers as a share of holders) so smaller stocks being discovered rise to the top."),
@@ -1358,32 +1435,54 @@ PRESETS = {
 
 
 def _presets(view_key) -> str:
-    links = [f'<a href="/signals?{_qs(view=view_key, **params)}"{_tip(tip)}>{_esc(label)}</a>'
+    # a value can be a function, worked out when the page is shown (e.g. "5 days ago")
+    links = [f'<a href="/signals?{_qs(view=view_key, **{k: v() if callable(v) else v for k, v in params.items()})}"'
+             f'{_tip(tip)}>{_esc(label)}</a>'
              for label, params, tip in PRESETS.get(view_key, [])]
     return f'<p class="note">Screens: {" &middot; ".join(links)}</p>' if links else ""
 
 
 def _backtest_summary(conn, rows) -> str:
-    """The headline tables above the Backtest list, and a background top-up of any stale prices
-    (each cluster's and the benchmarks'), so the results keep up without anyone re-running them."""
-    need = prices.stale(conn, [*{r["ticker"] for r in rows}, *backtest.BENCHMARKS])
-    fetching = ""
+    """The headline tables above the Backtest list. Keeps itself current: recent clusters' prices
+    are topped up in the background, and the stored history is refreshed if it's over a week old."""
+    cutoff = (dt.date.today() - dt.timedelta(days=backtest.LIVE_DAYS)).isoformat()
+    recent = [r["ticker"] for r in rows if r["known_on"] >= cutoff]
+    notes = []
+    need = prices.stale(conn, [*dict.fromkeys(recent), *backtest.BENCHMARKS])
     if need and prices.refresh_in_background(_db_file(conn), need):
-        fetching = (f'<p class="note">Updating prices for {len(need):,} ticker{"s" if len(need) != 1 else ""} '
-                    "in the background; reload in a minute for the latest returns.</p>")
-    first = conn.execute("SELECT MIN(filed_date) FROM insider_tx").fetchone()[0] or "-"
-    missing = sum(1 for r in rows if r.get("status") == "no prices yet")
-    caps = quotes.get_many(conn, [r["ticker"] for r in rows])
-    return (fetching
-            + f'<p class="note">Clusters since {_esc(first)} (the first filing in this database), each bought at '
-              "the next open after it became public. With only weeks of history these figures are a first look, "
-              "not evidence: they firm up as filings accumulate."
-            + (f" {missing} cluster{'s' if missing != 1 else ''} had no price history and are left out, which "
-               "flatters the results (delisted stocks are often the losers)." if missing else "") + "</p>"
+        notes.append(f"Updating prices for {len(need):,} recent ticker{'s' if len(need) != 1 else ''} in the background.")
+    last = backtest.last_refresh(conn)
+    stale = not last or dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(last) > dt.timedelta(days=7)
+    if background.running("backtest"):
+        notes.append("Updating the stored history in the background (the first run fetches price history for "
+                     "thousands of tickers and takes up to an hour; later runs take minutes).")
+    elif stale and backtest.refresh_in_background(_db_file(conn)):
+        notes.append("Started updating the stored history in the background.")
+    first = signals.data_start(conn) or "-"
+    priced = [r for r in rows if r.get("status") == "open"]
+    missing = sum(1 for r in rows if r.get("status") == "no prices")
+    head = (f'<p class="note">{len(rows):,} clusters since {_esc(first)}, each bought at the next open after it became '
+            f"public; {len(priced):,} have prices. "
+            + (f"{missing:,} have no price history (often delisted) and are left out, which flatters the results. "
+               if missing else "")
+            + f"History last updated: {_esc((last or 'never')[:16].replace('T', ' '))}."
+            + "".join(f" <strong>{_esc(n)}</strong>" for n in notes) + "</p>")
+    group_cols = ["group", "events", "avg_vs_iwm", "median_vs_iwm", "beat_iwm", "reliability"]
+    return (head
             + _table(backtest.summary(rows), ["horizon", "events", "median_return", "mean_return", "beat_spy",
                                               "median_vs_spy", "median_vs_iwm", "reliability"])
-            + '<p class="note" style="border-bottom:none">By kind of cluster, return to the latest close:</p>'
-            + _table(backtest.groups(rows, caps), ["group", "events", "median_vs_iwm", "median_vs_spy"])
+            + f'<p class="note" style="border-bottom:none">Which kinds of cluster did better: excess return over IWM '
+              f"{backtest.FACTOR_HORIZON} trading days after entry, by what was known at entry. The average (extremes "
+              "trimmed) is what holding all of them earned; the median is the typical one -- usually lower, "
+              "because a minority of big winners lifts the average:</p>"
+            + _table(backtest.groups(rows), group_cols)
+            + f'<p class="note" style="border-bottom:none">The live test: clusters since {backtest.TRACK_FROM}, when the '
+              "CFO screen was picked from the history above. Only these say whether it holds up going forward; "
+              "expect months before there are enough.</p>"
+            + _table(backtest.out_of_sample(rows), group_cols)
+            + '<p class="note" style="border-bottom:none">The same, early years against later ones. A difference that '
+              "shows up in only one period was probably luck; one that holds in both is worth trusting:</p>"
+            + _table(backtest.by_period(rows), group_cols)
             + '<p class="note" style="border-bottom:none">Every cluster:</p>')
 
 
@@ -1491,6 +1590,9 @@ def _db_file(conn) -> str:
     return conn.execute("PRAGMA database_list").fetchone()[2]
 
 
+MAX_TABLE_ROWS = 1000  # more than this and a page gets slow to load and scroll; the CSV has everything
+
+
 def page_signals(conn, qs):
     key = _one(qs, "view", VIEWS[0].key)
     view = VIEWS_BY_KEY.get(key, VIEWS[0])
@@ -1514,6 +1616,16 @@ def page_signals(conn, qs):
         market_note += _add_sparks(conn, all_rows, fetch=True)
     if "net_funds" in view.cols:
         market_note = _fund_note(conn) + market_note
+    if "quarter_timing" in view.cols:  # earnings dates not fetched yet (or due a refresh)
+        need = earnings.missing(conn, [r.get("issuer_cik") for r in all_rows if r.get("issuer_cik")])
+        if need and earnings.refresh_in_background(_db_file(conn), need):
+            market_note += (f'<p class="note">Fetching earnings dates for {len(need):,} '
+                            f'compan{"ies" if len(need) != 1 else "y"} from the SEC in the background.</p>')
+    if "flags" in view.cols:  # issuers whose type isn't known yet: look them up in the background
+        need = issuers.missing(conn, [r.get("issuer_cik") for r in all_rows if r.get("issuer_cik")])
+        if need and issuers.refresh_in_background(_db_file(conn), need):
+            market_note += (f'<p class="note">Checking {len(need):,} issuer{"s" if len(need) != 1 else ""} '
+                            "with the SEC (company or fund?) in the background.</p>")
     if view.key == "backtest":
         market_note = _backtest_summary(conn, all_rows) + market_note
     dfl = _read_date_filters(qs, view.date_filters)
@@ -1561,9 +1673,9 @@ def page_signals(conn, qs):
      {_tip(CONTROL_HELP['csv'])}>CSV</button></a>
 </form>
 {f'<p class="note">{_esc(view.note)}</p>' if view.note else ''}{_presets(view.key)}{market_note}
-{_table(rows, view.cols, sort_href=_sorter("/signals", base), sort_col=sort, sort_dir=direction,
+{_table(rows[:MAX_TABLE_ROWS], view.cols, sort_href=_sorter("/signals", base), sort_col=sort, sort_dir=direction,
         filter_cells=filter_cells)}
-<div class="count"><span>{f"{len(rows):,} of {len(all_rows):,} rows" if (flt or dfl) else f"{len(rows):,} rows"}</span>
+<div class="count"><span>{f"{len(rows):,} of {len(all_rows):,} rows" if (flt or dfl) else f"{len(rows):,} rows"}{f" -- showing the first {MAX_TABLE_ROWS:,}; sort or filter to see others, or download the CSV for all" if len(rows) > MAX_TABLE_ROWS else ""}</span>
   {clear_link}
   {'<span' + _tip("Only trades on or after this date are included. Change it with the window "
                   "control above.") + '>since ' + since + '</span>' if view.takes_since else ''}</div>"""
@@ -2164,7 +2276,7 @@ there is no per-ticker filter for Congress, only per-source date windows.</p>"""
 # ---------- jobs ----------
 
 JOB_LABELS = {"form4": "Form 4", "house": "House", "senate": "Senate",
-             "13f": "13F", "funds": "Funds", "update": "Update (all + report)"}
+             "13f": "13F", "funds": "Funds", "history": "History", "backtest": "Backtest", "update": "Update (all + report)"}
 
 
 def _job_form(source, label, fields_html, tip):
@@ -2219,6 +2331,16 @@ def page_jobs(qs):
                  "Download the SEC's two newest quarterly 13F data sets (every institution, about 200 MB, "
                  "only when they're new) and rebuild the fund columns of Fund / insider overlap. Takes a "
                  "minute or two; worth running once a quarter."),
+        _job_form("history", "History",
+                 f'<label{_tip("First year to load. The SEC data goes back to 2006; each year adds about 30,000 purchases.")}>'
+                 f'since <input type="number" name="since" value="2015" min="2006"></label>',
+                 "Load years of insider purchases from the SEC's quarterly data sets (about 10 MB a "
+                 "quarter). Only quarters not loaded yet are fetched, plus the newest one; a few minutes "
+                 "the first time, seconds after that. Feeds the backtest and routine-buyer flags."),
+        _job_form("backtest", "Backtest", "",
+                 "Compute and store the backtest for every cluster in the history: fetches each ticker's "
+                 "price history from Yahoo (up to an hour the first time; minutes after that, since only "
+                 "clusters still maturing are redone). The Backtest view also starts this itself weekly."),
         _job_form("update", "Update (all + report)", "",
                  "Run every source in turn -- Form 4 for all issuers over the last 3 days, "
                  "House for this year, Senate for the last 30 days, then 13F -- and rebuild the "
@@ -2268,7 +2390,9 @@ TABLE_PURPOSE = {
     "news_meta": "when each ticker's news was fetched", "cusip_ticker": "13F CUSIP to ticker lookups",
     "alert_log": "trades the Discord bot has handled", "alert_groups": "Discord bot cooldowns",
     "fund_flows": "every 13F filer's changes, per stock", "fund_tracked": "your watchlist managers' 13F positions",
-    "fund_meta": "which 13F quarters were compared",
+    "fund_meta": "which 13F quarters were compared", "earnings": "earnings report dates (SEC 8-K Item 2.02)",
+    "earnings_meta": "when each company's earnings dates were fetched", "bt_events": "stored backtest results, one per cluster",
+    "bt_meta": "when the backtest history was last updated", "issuer_info": "operating company or fund, per the SEC",
 }
 ERR_COLS = ["source", "doc_id", "note", "processed_at"]
 
@@ -2606,6 +2730,10 @@ def serve(db_path=None, host="127.0.0.1", port=8765, open_browser=True):
     db.connect(path).close()  # make sure the file and schema exist before serving
 
     _Handler.db_path = path
+    try:
+        jobs.load_history(path)  # each source's last finished run, so the Jobs tab survives a restart
+    except Exception as exc:
+        __import__("logging").getLogger(__name__).warning("could not load past job runs: %s", exc)
     try:
         httpd = _Server((host, port), _Handler)
     except OSError as exc:

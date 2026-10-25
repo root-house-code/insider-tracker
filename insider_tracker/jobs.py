@@ -11,12 +11,12 @@ import datetime as dt
 import logging
 import threading
 
-from . import config, db, edgar_13f, edgar_form4, funds, house, report, senate
+from . import config, db, edgar_13f, edgar_form4, form345, funds, house, report, senate
 from .edgar_common import tickers_to_ciks
 from .net import PoliteSession
 
 log = logging.getLogger(__name__)
-SOURCES = ("form4", "house", "senate", "13f", "funds", "update")
+SOURCES = ("form4", "house", "senate", "13f", "funds", "history", "backtest", "update")
 
 _lock = threading.Lock()
 _jobs = {}  # source -> {status, started_at, finished_at, message, error}
@@ -105,6 +105,67 @@ def _run(source: str, db_path, params: dict):
                     if _jobs.get(s, {}).get("status") in BUSY:
                         _jobs[s].update(status="skipped", finished_at=_now(),
                                         message="not run: Update stopped first")
+        _persist(db_path, (source, *UPDATE_SOURCES) if source == "update" else (source,))
+
+
+def _persist(db_path, sources):
+    """Remember each finished run in the database, so the Jobs tab still shows it after a restart.
+    Only finished runs are saved: one cut off by a restart shows the last run that did finish."""
+    with _lock:
+        rows = [(s, j.get("status"), j.get("started_at"), j.get("finished_at"), j.get("message") or j.get("error"))
+                for s in sources for j in [_jobs.get(s, {})] if j.get("status") not in BUSY and j.get("finished_at")]
+    if not rows:
+        return
+    try:
+        conn = db.connect(db_path)
+        try:
+            conn.executemany("INSERT OR REPLACE INTO job_runs (source, status, started_at, finished_at, message) "
+                             "VALUES (?,?,?,?,?)", rows)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:  # the run itself is done; failing to remember it mustn't look like a failure
+        log.warning("could not save the last run of %s: %s", ", ".join(r[0] for r in rows), exc)
+
+
+def record(conn, source, status, started_at, finished_at, message):
+    """Save a run made outside the Jobs tab (the command line, a scheduled task)."""
+    conn.execute("INSERT OR REPLACE INTO job_runs (source, status, started_at, finished_at, message) "
+                 "VALUES (?,?,?,?,?)", (source, status, started_at, finished_at, message))
+    conn.commit()
+
+
+def load_history(db_path=None):
+    """Seed the Jobs tab with each source's last finished run (call once when the UI starts)."""
+    conn = db.connect(db_path)
+    try:
+        saved = {r["source"]: dict(r) for r in conn.execute("SELECT * FROM job_runs")}
+        # Sources with no saved run (ingested before runs were saved): when they last stored
+        # anything, from the database's own records. Those times are UTC; show them local.
+        evidence = {"form4": "form4", "house": "house", "senate": "senate", "13f": "13f", "history": "form345"}
+        for job, src in evidence.items():
+            if job in saved:
+                continue
+            last = conn.execute("SELECT MAX(processed_at) FROM processed WHERE source=?", (src,)).fetchone()[0]
+            if last:
+                local = (dt.datetime.fromisoformat(last).replace(tzinfo=dt.timezone.utc).astimezone()
+                         .replace(tzinfo=None).isoformat(timespec="seconds"))
+                saved[job] = {"status": "ok", "started_at": None, "finished_at": local,
+                              "message": "last data stored at this time (run before run history was kept)"}
+        if "funds" not in saved:
+            r = conn.execute("SELECT MAX(loaded_at) FROM fund_meta").fetchone()[0]
+            if r:
+                local = dt.datetime.fromisoformat(r).astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+                saved["funds"] = {"status": "ok", "started_at": None, "finished_at": local,
+                                  "message": "last 13F summary built at this time (run before run history was kept)"}
+    finally:
+        conn.close()
+    with _lock:
+        for s, r in saved.items():
+            if s in SOURCES and _jobs.get(s, {}).get("status") not in BUSY:
+                _jobs[s] = {"status": r["status"], "started_at": r["started_at"], "finished_at": r["finished_at"],
+                            "message": r["message"] if r["status"] != "error" else None,
+                            "error": r["message"] if r["status"] == "error" else None}
 
 
 def _run_form4(conn, params: dict) -> str:
@@ -155,6 +216,17 @@ def _run_funds(conn, params: dict) -> str:
             f"({r['with_ticker'] + r.get('confirmed', 0):,} with a ticker)")
 
 
+def _run_history(conn, params: dict) -> str:
+    r = form345.ingest(conn, since_year=int(params.get("since") or 2015))
+    return f"{r['quarters']} quarter(s), {r['purchases']:,} purchases; earliest trade {r['earliest']}"
+
+
+def _run_backtest(conn, params: dict) -> str:
+    from . import backtest
+    r = backtest.refresh(conn)
+    return f"{r['events']:,} clusters stored, prices fetched for {r['fetched']:,} of {r['tickers']:,} tickers"
+
+
 def _run_update(conn, params: dict) -> str:
     # Form 4 runs unfiltered: Update is the "refresh everything" button, so it
     # shouldn't silently depend on a watchlist (which may well be empty).
@@ -183,4 +255,4 @@ def _run_update(conn, params: dict) -> str:
 
 
 _RUNNERS = {"form4": _run_form4, "house": _run_house, "senate": _run_senate,
-            "13f": _run_13f, "funds": _run_funds, "update": _run_update}
+            "13f": _run_13f, "funds": _run_funds, "history": _run_history, "backtest": _run_backtest, "update": _run_update}

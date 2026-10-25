@@ -134,6 +134,52 @@ SQLite file; output is a Markdown report + CSVs per section.
     name with 13F names, and confirms with OpenFIGI. It accepts an unconfirmed match only when
     OpenFIGI knows nothing and exactly one CUSIP has that name. 72% of insider-bought tickers match;
     the rest are mostly funds, fresh IPOs and OTC micro-caps.
+- `form345.py` loads history from the SEC Insider Transactions Data Sets: one zip per filing
+  quarter, about 10 MB, purchases only. Rows land in `insider_tx` in the live parser's shape.
+  - **Overlap with the live ingest:** accessions already present are skipped, so there are no
+    duplicates.
+  - **Prices are rounded to the cent** in the data sets (the live parser keeps 4 decimals), which is
+    why `lockstep` compares to the cent.
+  - **Dates:** about 1% of rows had impossible or 2+-years-late trade dates and are dropped
+    (`_plausible`). Older files lack AFF10B5ONE, so use `.get` for optional columns.
+- `signals.buyer_type` adapts Cohen, Malloy and Pomorski (2012) to purchases: routine (same
+  month in each of the 3 prior years), first buy, occasional, or unknown (data too short). Each
+  insider is judged per issuer by first CIK. A cluster where every buyer is routine gets the
+  "routine" noise flag.
+- Exploration (2026-10-24, about 10,000 priced clusters at 2+ insiders). Of 34 entry-time traits,
+  only a few held in both 2015-2020 and 2021+:
+  - **CFO among the buyers:** about +2% average excess over IWM at 60/120 days, in both periods.
+    That's the CFO preset, and `backtest.TRACK_FROM` marks where its out-of-sample record starts.
+  - **REITs:** worse in both periods, so they get the "reit" noise flag.
+  - **Penny stocks looked best,** but they're 45% unpriced (delisted), so don't trust that.
+  - Re-test before adding any new screen, and judge it only on clusters after it was chosen.
+- `earnings.py` reads earnings report dates from 8-Ks with Item 2.02, including the older
+  "files" pages, back to 2014, and stores them in the `earnings` table. `days_since_results`
+  measures from the last report strictly before the first buy, and needs 4 or more reports (fewer
+  usually means the company doesn't file 2.02). `quarter_timing` buckets the result.
+  - CFO + 1-2 months after results: 278 clusters, avg +3.7% / median +0.9% vs IWM, 54% beat.
+    It's tracked out of sample from TRACK_FROM.
+  - The backtest group tables show a trimmed average and a median. They differ a lot (skew), so
+    always quote both.
+- `backtest.py` at history scale (about 17,000 clusters since 2015, about 5,000 tickers).
+  `refresh()` (the Backtest job) fetches each ticker's Yahoo history once and stores result rows as
+  JSON in `bt_events`, with `final=1` once ret_120d exists (or no prices after a year). The view
+  merges those with `live_events` for the last 200 days.
+  - **No hindsight:** levels 2/3/4 are dated separately. Factors use only trades filed by the signal
+    date. Size is dollar volume at entry; today's market cap would be look-ahead.
+  - **Reused tickers:** a price history starting more than 10 days after the signal counts as "no
+    prices" (often a recycled symbol).
+  - Tables over 1,000 rows show the first 1,000 (`MAX_TABLE_ROWS`); the CSV has everything.
+- Noise filters (`issuers.py`, `signals.lockstep`). In the October 2026 data, 25 of 67 clusters
+  were noise: 11 fund issuers and 16 lockstep groups, which were employee purchase plans,
+  dividend-reinvestment plans, discounted placements and IPO allocations.
+  - **Fund vs company.** A fund has no SIC code and files N-CSR/N-2. A company has a SIC and files
+    10-K/20-F. Name rules would misfile REITs ("Trust"). BDCs (no SIC but 10-K filers) count as
+    companies, deliberately.
+  - **Lockstep** means 2+ insiders, one price, one day. It can catch two directors who genuinely
+    bought together, so it's a hide-by-default flag, never a delete.
+  - **Tests** opt out with hide_noise=0 / skip_lockstep=False, because `_trade` defaults give
+    everyone $100 on the same day.
 - `db.py` schema; `processed` table makes every source incremental (errors retry next run)
 - `cusip_map.py` 13F gives only CUSIPs. Two sources, labelled in `cusip_ticker.source`: OpenFIGI by
   CUSIP (`figi`; free, 25 req/min x 10, but its US coverage has holes -- real listed companies like
