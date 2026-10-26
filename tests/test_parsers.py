@@ -2087,6 +2087,30 @@ def test_backtest_has_its_own_tab():
             srv.server_close()
 
 
+def test_backtest_account_simulation():
+    """An account following a screen: one slot per signal out of IWM, back into IWM at the exit,
+    costs off each round trip, signals skipped when every slot is full."""
+    from insider_tracker import backtest
+    days = [f"2025-12-{d:02d}" for d in (29, 30, 31)] + [f"2026-01-{d:02d}" for d in (2, 5, 6, 7, 8)]
+    flat = [{"date": d, "close": 100.0} for d in days]
+    trade = lambda entry, ret, h=2: {"entry_date": entry, f"ret_{h}d": ret}
+    sim = backtest.simulate([trade("2025-12-30", 10.0)], flat, h=2, slots=10, cost=0.5)
+    # 10 of 100 into the stock on 30 Dec, sold at the close on 31 Dec: 10 x 1.10 x 0.995 = 10.945
+    assert abs(sim["years"][0]["account"] - 0.945) < 1e-9 and sim["years"][0]["index"] == 0.0
+    assert sim["taken"] == 1 and sim["skipped"] == 0
+    # one slot: the second signal arrives while it's taken, and is skipped
+    sim = backtest.simulate([trade("2025-12-30", 10.0, 3), trade("2025-12-31", 50.0, 3)], flat, h=3, slots=1, cost=0)
+    assert (sim["taken"], sim["skipped"]) == (1, 1)
+    # a position still open at the year end counts at cost; its gain lands in the year it's sold
+    sim = backtest.simulate([trade("2025-12-31", 20.0, 3)], flat, h=3, slots=10, cost=0)
+    assert [round(y["account"], 6) for y in sim["years"]] == [0.0, 2.0]
+    # IWM's own growth carries the money that isn't in a stock
+    rising = [{"date": d, "close": 100.0 + 10 * i} for i, d in enumerate(days)]
+    sim = backtest.simulate([trade("2026-01-05", 0.0)], rising, h=2, slots=10, cost=0)
+    assert sim["index_cagr"] > 0 and sim["years"][-1]["index"] > 0
+    assert backtest.simulate([], flat) == {}, "no trades, no account"
+
+
 def test_ui_sorting():
     """Column sorting: numeric order, text order, and blanks always last."""
     rows = [{"t": "b", "v": 5.0}, {"t": "a", "v": 100.0}, {"t": "c", "v": None},

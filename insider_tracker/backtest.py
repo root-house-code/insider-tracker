@@ -486,6 +486,96 @@ PERIODS = [
 ]
 
 
+SLOTS = 10          # the simulated account holds at most this many positions, each 1/SLOTS of it
+COST = 0.5          # percent per round trip (buy and sell), taken off every trade
+
+
+def simulate(rows, index, h=FACTOR_HORIZON, slots=SLOTS, cost=COST) -> dict:
+    """An account that follows a screen: it sits in an index (IWM or SPY); each new cluster takes one
+    of `slots` equal slots (1/slots of the account, out of the index) at its entry, is sold `h` trading
+    days later and the money goes back into the index. Signals that arrive while every slot is full
+    are skipped (and counted).
+
+    `index` is that index's daily bars, both where idle money sits and what the account is judged
+    against. Positions are valued at cost until they're sold -- the stored results
+    hold each trade's return at its exit, not its daily path -- so a position open on 31 December
+    counts at cost in that year and its gain or loss lands in the year it's sold. Clusters too
+    recent to have reached the exit have no result yet and are left out.
+
+    Returns {"years": [{year, account, index}], "cagr", "index_cagr", "taken", "skipped", "exposure"}."""
+    days = [b["date"] for b in index]
+    close = {b["date"]: b["close"] for b in index}
+    if len(days) < 2:
+        return {}
+    entries = {}
+    for r in rows:
+        ret = r.get(f"ret_{h}d")
+        if ret is None or not r.get("entry_date"):
+            continue
+        i = bisect.bisect_left(days, r["entry_date"])
+        if i + h - 1 >= len(days):
+            continue
+        entries.setdefault(days[i], []).append((days[i + h - 1], ret))
+    if not entries:
+        return {}
+    first = min(entries)
+    start = days.index(first)
+    sleeve, open_pos = 100.0, []     # money in IWM; [(exit day, stake, return %)]
+    bench = 100.0
+    years, taken, skipped, exposure = [], 0, 0, []
+    year_start = (first[:4], sleeve, bench)
+    for k in range(start, len(days)):
+        d = days[k]
+        if k > start:
+            growth = close[d] / close[days[k - 1]]
+            sleeve *= growth
+            bench *= growth
+        for p in [p for p in open_pos if p[0] == d]:   # sold at today's close; money back into IWM
+            sleeve += p[1] * (1 + p[2] / 100) * (1 - cost / 100)
+            open_pos.remove(p)
+        for exit_day, ret in entries.get(d, []):        # bought at today's open
+            if len(open_pos) >= slots:
+                skipped += 1
+                continue
+            stake = (sleeve + sum(p[1] for p in open_pos)) / slots
+            sleeve -= stake
+            open_pos.append((exit_day, stake, ret))
+            taken += 1
+        total = sleeve + sum(p[1] for p in open_pos)
+        exposure.append(sum(p[1] for p in open_pos) / total if total else 0)
+        last_of_year = k == len(days) - 1 or days[k + 1][:4] != d[:4]
+        if last_of_year:
+            years.append({"year": d[:4], "account": 100 * (total / year_start[1] - 1),
+                          "index": 100 * (bench / year_start[2] - 1)})
+            year_start = (str(int(d[:4]) + 1), total, bench)
+    span = (dt.date.fromisoformat(days[-1]) - dt.date.fromisoformat(first)).days / 365.25
+    total = sleeve + sum(p[1] for p in open_pos)
+    return {"years": years, "cagr": 100 * ((total / 100) ** (1 / span) - 1) if span > 0 else None,
+            "index_cagr": 100 * ((bench / 100) ** (1 / span) - 1) if span > 0 else None,
+            "taken": taken, "skipped": skipped, "exposure": 100 * st.mean(exposure) if exposure else None,
+            "from": first, "to": days[-1]}
+
+
+def portfolios(conn, rows, h=FACTOR_HORIZON) -> tuple:
+    """(summary rows, per-year rows) for an account following each screen, once parked in and judged
+    against IWM (small caps, the like-for-like yardstick) and once against SPY (the S&P 500, "the
+    market" -- a higher bar after 2021, when big companies far outran small ones)."""
+    summary, years = [], {}
+    for index in BENCHMARKS:  # IWM first, then SPY
+        bars = prices.bars(conn, index, BENCH_FROM)
+        for name, sel in SCREENS:
+            s = simulate([r for r in rows if sel(r)], bars, h)
+            summary.append({"screen": name, "index": index, "per_year": s.get("cagr"),
+                            "index_per_year": s.get("index_cagr"),
+                            "extra_per_year": (s["cagr"] - s["index_cagr"]) if s.get("cagr") is not None else None,
+                            "trades": s.get("taken"), "skipped": s.get("skipped"), "invested": s.get("exposure")})
+            for y in s.get("years", []):
+                row = years.setdefault(y["year"], {"year": y["year"]})
+                row[index] = y["index"]
+                row[f"{name} ({index})"] = y["account"]
+    return summary, [years[y] for y in sorted(years)]
+
+
 def screens(rows, h=FACTOR_HORIZON) -> list:
     """Each screen in each period: how it did against IWM at the h-trading-day horizon. The out of
     sample row is the real test -- those clusters came after the screen was chosen."""

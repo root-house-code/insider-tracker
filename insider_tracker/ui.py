@@ -326,6 +326,29 @@ COLUMN_HELP = {
     "reliability": "Whether the number of clusters is enough to tell a real effect from luck. A few "
                    "weeks of overlapping events from one market is a small sample whatever the count.",
     "group": "A slice of the clusters, to see which kinds have done better.",
+    "index": "The index the account parks idle money in, and is judged against: IWM (small caps) or SPY "
+             "(the S&P 500).",
+    "per_year": "The simulated account's average yearly return following this screen (compounded, after "
+                "trading costs), over the same years as the index figure beside it.",
+    "index_per_year": "That index's own average yearly return over the same span: what to beat.",
+    "extra_per_year": "Account per year minus the index per year, in percentage points: how much more (or less) "
+                      "a year following the screen made than just holding the index.",
+    "trades": "Clusters the account actually bought.",
+    "skipped": "Clusters it couldn't buy because every slot was taken. A screen that fires often skips many "
+               "-- which ones it gets is down to timing, so its result is partly luck of the draw.",
+    "invested": "Share of the time the money was in screened stocks rather than IWM.",
+    "year": "Calendar year.",
+    "IWM": "IWM's (small caps) return that calendar year.",
+    "SPY": "SPY's (S&P 500) return that calendar year.",
+    "all clusters": "The account following every clean cluster: its return that year.",
+    "CFO buying": "The account following the CFO buying screen: its return that year.",
+    "CFO mid-quarter": "The account following the CFO mid-quarter screen: its return that year.",
+    "all clusters (IWM)": "The account following every clean cluster, parked in IWM: its return that year.",
+    "all clusters (SPY)": "The account following every clean cluster, parked in SPY: its return that year.",
+    "CFO buying (IWM)": "The account following the CFO buying screen, parked in IWM: its return that year.",
+    "CFO buying (SPY)": "The account following the CFO buying screen, parked in SPY: its return that year.",
+    "CFO mid-quarter (IWM)": "The account following the CFO mid-quarter screen, parked in IWM: its return that year.",
+    "CFO mid-quarter (SPY)": "The account following the CFO mid-quarter screen, parked in SPY: its return that year.",
     "screen": "A screen being tested: a rule for which clusters to buy. All clusters is the baseline to beat.",
     "period": "Which clusters: all of them, the early or later years, or only those since the screens were "
               "chosen (out of sample -- the real test).",
@@ -640,7 +663,8 @@ COUNT_COLS = {"net_funds", "funds_new", "funds_added", "funds_cut", "funds_exite
               "shares", "shares_after", "shares_now", "shares_prior", "insiders",
               "members", "buys", "sells", "lag_days", "seq"}
 RATIO_COLS = {"bought_sold_ratio"}
-BACKTEST_PCT = ("prior_30d", "beat_iwm", "ret_5d", "ret_10d", "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm",
+BACKTEST_PCT = ("per_year", "index_per_year", "extra_per_year", "IWM", "SPY",
+                *[f"{n} ({i})" for n in ("all clusters", "CFO buying", "CFO mid-quarter") for i in ("IWM", "SPY")], "prior_30d", "beat_iwm", "ret_5d", "ret_10d", "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm",
                 "median_return", "mean_return", "median_vs_spy", "median_vs_iwm", "avg_vs_iwm")
 COMPACT_COLS = {"market_cap": "$", "avg_volume": ""}  # shown as $1.2B / 340K; sorted on the number
 STAKE_COLS = {"stake_change", "max_stake_change"}  # percent; math.inf = a brand-new position
@@ -998,7 +1022,7 @@ def _cell(col, v):
         return COMPACT_COLS[col] + _compact(v), "num"
     if col in STAKE_COLS and isinstance(v, (int, float)):
         return signals.stake_text(v), "num"
-    if col in ("beat_spy", "beat_iwm") and isinstance(v, (int, float)):
+    if col in ("beat_spy", "beat_iwm", "invested") and isinstance(v, (int, float)):
         return f"{v:.0f}%", "num"
     if col in ("pct_change", "fund_shares_change", "fund_breadth") + BACKTEST_PCT and isinstance(v, (int, float)):
         return f"{v:+,.1f}%", "num"
@@ -1496,6 +1520,29 @@ AVG_VS_MEDIAN = ("The average (extremes trimmed) is what holding all of them ear
                  "usually lower, because a minority of big winners lifts the average.")
 
 
+def _portfolio_html(conn, rows, h, held) -> str:
+    """The Screens tab's account simulation: what following each screen would have made per year."""
+    summary, years = backtest.portfolios(conn, rows, h)
+    if not years:
+        return ""
+    names = [name for name, _ in backtest.SCREENS]
+    return (f'<p class="note" style="border-bottom:none"><strong>As an account.</strong> Starting fully in an index, each '
+            f"new cluster gets one of {backtest.SLOTS} equal slots (a tenth of the account), held {held}, then the "
+            f"money goes back into the index; signals arriving while every slot is full are skipped. Each screen "
+            "is run twice: parked in and judged against IWM (small caps, like-for-like), and against SPY (the "
+            "S&P 500 -- a higher bar since 2021, when big companies far outran small ones). "
+            f"{backtest.COST}% is taken off each round trip for trading costs. This uses every trade's actual "
+            "return, big winners included, so it moves far more than the trimmed averages above -- and the "
+            "years swing hard. Delisted companies are missing (they'd pull it down), and the screens were "
+            "chosen from this same history, so read it as an upper bound, not a forecast.</p>"
+            + _table(summary, ["screen", "index", "per_year", "index_per_year", "extra_per_year", "trades",
+                               "skipped", "invested"])
+            + '<p class="note" style="border-bottom:none">Year by year: each index, then each account (parked in '
+              "that index) -- its return in each calendar year; the current year is to date:</p>"
+            + _table(years, ["year", *backtest.BENCHMARKS[::-1],
+                             *[f"{n} ({i})" for i in backtest.BENCHMARKS[::-1] for n in names]]))
+
+
 def page_backtest(conn, qs):
     """The Backtest tab: one question per sub-tab, sharing min insiders, hide noise and the holding
     period."""
@@ -1538,7 +1585,8 @@ def page_backtest(conn, qs):
                    f"The out-of-sample row counts only clusters since {backtest.TRACK_FROM}, after the screens were chosen "
                    "from this history: it's the real test, and it will take months to fill.</p>"
                    + _table(backtest.screens(rows, h), ["screen", "period", "events", "avg_vs_iwm", "median_vs_iwm",
-                                                        "beat_iwm", "reliability"]))
+                                                        "beat_iwm", "reliability"])
+                   + _portfolio_html(conn, rows, h, held))
     else:  # factors
         content = (f'<p class="note" style="border-bottom:none">Excess return over IWM, held {held}, by what was known '
                    f"at entry. {AVG_VS_MEDIAN}</p>"
