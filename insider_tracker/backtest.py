@@ -196,9 +196,28 @@ def stored_events(conn, level=2, hide_noise=1) -> list:
     return [r for r in rows if not (hide_noise and r.get("flags"))]
 
 
+_events_cache = {}
+
+
 def events(conn, level=2, hide_noise=1, today=None) -> list:
-    """Every cluster: stored history, with the recent ones recomputed live on top."""
+    """Every cluster: stored history, with the recent ones recomputed live on top. Cached until
+    anything it reads changes -- a new filing, a price top-up, a refreshed history -- which three
+    instant lookups detect, so switching between Backtest sub-tabs doesn't redo seconds of work."""
     today = today or dt.date.today().isoformat()
+    stamp = (conn.execute("SELECT MAX(rowid) FROM insider_tx").fetchone()[0],
+             conn.execute("SELECT MAX(rowid) FROM prices").fetchone()[0],
+             conn.execute("SELECT COUNT(*), MAX(rowid) FROM bt_events").fetchone()[:],
+             conn.execute("SELECT value FROM bt_meta WHERE name='refreshed_at'").fetchone())
+    key = (conn.execute("PRAGMA database_list").fetchone()[2], level, hide_noise, today)
+    hit = _events_cache.get(key)
+    if hit and hit[0] == stamp:
+        return [dict(r) for r in hit[1]]
+    rows = _events(conn, level, hide_noise, today)
+    _events_cache[key] = (stamp, rows)
+    return [dict(r) for r in rows]
+
+
+def _events(conn, level, hide_noise, today) -> list:
     live = {_key(r): r for r in live_events(conn, level, hide_noise, today)}
     cutoff = (dt.date.fromisoformat(today) - dt.timedelta(days=LIVE_DAYS)).isoformat()
     rows = [r for r in stored_events(conn, level, hide_noise) if r["known_on"] < cutoff and _key(r) not in live]
@@ -421,44 +440,69 @@ has_cfo = lambda r: "CFO" in (r.get("roles") or "").split(",")
 cfo_mid = lambda r: has_cfo(r) and r.get("quarter_timing") == earnings.MID_QUARTER
 
 
-def groups(rows, caps=None) -> list:
+def groups(rows, caps=None, h=FACTOR_HORIZON) -> list:
     """Which kinds of cluster have done better: median 60-day excess over IWM by each factor known
     at entry. caps is unused (kept for callers): size is judged by dollar volume at entry."""
     dv = lambda r: r.get("dollar_volume") or 0
     pr = lambda r: r.get("prior_30d")
     return [
-        _slice("all clusters", rows, lambda r: True),
-        _slice("a first-time buyer among them", rows, lambda r: "first buy" in (r.get("buyers") or "")),
-        _slice("only routine buyers", rows, lambda r: (r.get("buyers") or "") == "routine"),
-        _slice("CFO among the buyers", rows, has_cfo),
-        _slice("CFO, bought 1-2 months after results", rows, cfo_mid),
-        _slice("no CFO among the buyers", rows, lambda r: not has_cfo(r)),
-        _slice("CEO or CFO among the buyers", rows, lambda r: r.get("top_exec")),
-        _slice("no CEO or CFO", rows, lambda r: not r.get("top_exec")),
-        _slice("stock fell 10%+ in the month before", rows, lambda r: pr(r) is not None and pr(r) <= -10),
-        _slice("stock rose 10%+ in the month before", rows, lambda r: pr(r) is not None and pr(r) >= 10),
-        _slice("trades under $1M a day", rows, lambda r: 0 < dv(r) < 1e6),
-        _slice("trades $1M-$20M a day", rows, lambda r: 1e6 <= dv(r) < 2e7),
-        _slice("trades over $20M a day", rows, lambda r: dv(r) >= 2e7),
-        _slice("insiders bought over $1M", rows, lambda r: (r.get("total_value") or 0) >= 1e6),
+        _slice("all clusters", rows, lambda r: True, h),
+        _slice("a first-time buyer among them", rows, lambda r: "first buy" in (r.get("buyers") or ""), h),
+        _slice("only routine buyers", rows, lambda r: (r.get("buyers") or "") == "routine", h),
+        _slice("CFO among the buyers", rows, has_cfo, h),
+        _slice("CFO, bought 1-2 months after results", rows, cfo_mid, h),
+        _slice("no CFO among the buyers", rows, lambda r: not has_cfo(r), h),
+        _slice("CEO or CFO among the buyers", rows, lambda r: r.get("top_exec"), h),
+        _slice("no CEO or CFO", rows, lambda r: not r.get("top_exec"), h),
+        _slice("stock fell 10%+ in the month before", rows, lambda r: pr(r) is not None and pr(r) <= -10, h),
+        _slice("stock rose 10%+ in the month before", rows, lambda r: pr(r) is not None and pr(r) >= 10, h),
+        _slice("trades under $1M a day", rows, lambda r: 0 < dv(r) < 1e6, h),
+        _slice("trades $1M-$20M a day", rows, lambda r: 1e6 <= dv(r) < 2e7, h),
+        _slice("trades over $20M a day", rows, lambda r: dv(r) >= 2e7, h),
+        _slice("insiders bought over $1M", rows, lambda r: (r.get("total_value") or 0) >= 1e6, h),
     ]
 
 
-def out_of_sample(rows) -> list:
+def out_of_sample(rows, h=FACTOR_HORIZON) -> list:
     """Clusters since TRACK_FROM, the day the CFO screen was picked: the only fair test of it."""
     fresh = [r for r in rows if r["known_on"] >= TRACK_FROM]
-    return [_slice(f"since {TRACK_FROM}: all clusters", fresh, lambda r: True),
-            _slice(f"since {TRACK_FROM}: CFO among the buyers", fresh, has_cfo),
-            _slice(f"since {TRACK_FROM}: CFO, 1-2 months after results", fresh, cfo_mid),
-            _slice(f"since {TRACK_FROM}: no CFO", fresh, lambda r: not has_cfo(r))]
+    return [_slice(f"since {TRACK_FROM}: all clusters", fresh, lambda r: True, h),
+            _slice(f"since {TRACK_FROM}: CFO among the buyers", fresh, has_cfo, h),
+            _slice(f"since {TRACK_FROM}: CFO, 1-2 months after results", fresh, cfo_mid, h),
+            _slice(f"since {TRACK_FROM}: no CFO", fresh, lambda r: not has_cfo(r), h)]
 
 
-def by_period(rows) -> list:
+# The screens being tested, side by side. A new hypothesis is a new line here, not a new page.
+SCREENS = [
+    ("all clusters", lambda r: True),
+    ("CFO buying", lambda r: has_cfo(r)),
+    ("CFO mid-quarter", lambda r: cfo_mid(r)),
+]
+PERIODS = [
+    ("2015 to now", lambda r: True),
+    ("2015-2020", lambda r: r["known_on"] < "2021"),
+    ("2021 on", lambda r: r["known_on"] >= "2021"),
+    (f"since {TRACK_FROM} (out of sample)", lambda r: r["known_on"] >= TRACK_FROM),
+]
+
+
+def screens(rows, h=FACTOR_HORIZON) -> list:
+    """Each screen in each period: how it did against IWM at the h-trading-day horizon. The out of
+    sample row is the real test -- those clusters came after the screen was chosen."""
+    out = []
+    for name, sel in SCREENS:
+        for period, in_period in PERIODS:
+            g = _slice(name, [r for r in rows if in_period(r)], sel, h)
+            out.append({"screen": name, "period": period, **{k: v for k, v in g.items() if k != "group"}})
+    return out
+
+
+def by_period(rows, h=FACTOR_HORIZON) -> list:
     """The same 60-day comparison for the early years and the later ones: a factor that only works
     in one of them was probably luck. (Tune on the first, check on the second.)"""
     out = []
     for label, lo, hi in (("2015-2020 (tune on this)", "2015", "2021"), ("2021 onwards (check on this)", "2021", "9999")):
         part = [r for r in rows if lo <= r["known_on"][:4] < hi]
-        for g in groups(part):
+        for g in groups(part, h=h):
             out.append({**g, "group": f"{label}: {g['group']}"})
     return out

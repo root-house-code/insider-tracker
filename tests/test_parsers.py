@@ -1746,9 +1746,26 @@ def test_backtest_replays_clusters_from_when_they_were_public():
         assert backtest.signals_for([{"trans_date": "2026-10-01", "filed_date": "2026-10-02", "accession": "a",
                                       "who": "1", "value": 1}], 2) == []
 
-        page = ui.page_signals(conn, {"view": ["backtest"]})
+        page = ui.page_backtest(conn, {})
         assert "clusters since 2026-10-02" in page and ">+20.0%<" in page and "too few to read" in page
-        assert ">all clusters<" in page and "check on this" in page, "the factor and period tables"
+        factors = ui.page_backtest(conn, {"tab": ["factors"], "h": ["5"]})
+        assert ">all clusters<" in factors and "check on this" in factors, "the factor and period tables"
+        assert "held 1 week" in factors and "+8.0%" in factors, "5 trading days: 50 -> 54 entry-to-close"
+        screens = ui.page_backtest(conn, {"tab": ["screens"], "h": ["5"]})
+        assert ">CFO mid-quarter<" in screens and "(out of sample)" in screens and ">all clusters<" in screens
+        listing = ui.page_backtest(conn, {"tab": ["clusters"]})
+        assert 'name="tab" value="clusters"' in listing and 'href="/chart?ticker=ACME"' in listing
+        assert "tab=clusters" in re.search(r'<th[^>]*><a href="([^"]*)"', listing).group(1), \
+            "sorting a column stays on the Clusters sub-tab"
+
+        # cached between sub-tabs, but never stale: a new price changes the answer at once
+        before = backtest.events(conn, today="2026-10-20")[0]["ret_to_date"]
+        conn.execute("UPDATE prices SET close=70 WHERE symbol='ACME' AND date='2026-10-20'")
+        db.insert_rows(conn, "prices", [{"symbol": "ACME", "date": "2026-10-21", "open": 70, "high": 70, "low": 70,
+                                         "close": 70, "adj_close": 70, "volume": 1}])
+        conn.commit()
+        after = backtest.events(conn, today="2026-10-21")[0]["ret_to_date"]
+        assert abs(before - 20.0) < 1e-9 and abs(after - 40.0) < 1e-9
 
 
 def test_noise_filters_drop_funds_and_lockstep_buys():
@@ -2042,6 +2059,32 @@ def test_earnings_dates_and_quarter_timing():
         assert (r["since_results"], r["quarter_timing"]) == (46, "1-2 months after results")
         g = {x["group"]: x for x in backtest.groups([r])}
         assert g["CFO, bought 1-2 months after results"]["events"] == 1
+
+
+def test_backtest_has_its_own_tab():
+    """The backtest answers "has this worked?", so it's a top-level tab, not a Signals view; old
+    /signals?view=backtest links still land there."""
+    with _tmpdb() as conn:
+        conn.row_factory = sqlite3.Row
+        signals_page = ui.page_signals(conn, {})
+        assert 'href="/backtest"' in signals_page, "in the top navigation"
+        assert "view=backtest" not in signals_page, "no longer a Signals sub-tab"
+        page = ui.page_backtest(conn, {})
+        assert 'action="/backtest"' in page and "view=cluster_buys" not in page, "not the Signals sub-tabs"
+        assert all(f"tab={k}" in page for k in ("summary", "screens", "factors", "clusters")), "its own sub-tabs"
+        assert '<a href="/backtest" class="on"' in page, "its own tab is the active one"
+        db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+        srv = ui._Server(("127.0.0.1", 0), type("H", (ui._Handler,), {"db_path": db_path}))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            r = requests.get(f"http://127.0.0.1:{srv.server_port}/signals?view=backtest&p_min_insiders=3",
+                             allow_redirects=False)
+            assert r.status_code == 301 and r.headers["Location"].startswith("/backtest?")
+            assert "p_min_insiders=3" in r.headers["Location"], "settings carry over"
+            assert requests.get(f"http://127.0.0.1:{srv.server_port}/backtest").status_code == 200
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 def test_ui_sorting():

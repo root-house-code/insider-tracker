@@ -57,7 +57,7 @@ def _v(key, title, fn, params, cols, note="", tip="", takes_since=True, date_fil
 # Everything the UI explains on hover. One place, so the vocabulary stays
 # consistent between a tab, its controls and its columns.
 
-NAV_TABS = [("signals", "Signals"), ("raw", "Raw tables"), ("sql", "SQL"),
+NAV_TABS = [("signals", "Signals"), ("backtest", "Backtest"), ("raw", "Raw tables"), ("sql", "SQL"),
             ("watchlist", "Watchlist"), ("tone", "Tone"), ("jobs", "Jobs"),
             ("status", "Status"), ("architecture", "Architecture")]
 
@@ -68,6 +68,10 @@ NAV_TABS = [("signals", "Signals"), ("raw", "Raw tables"), ("sql", "SQL"),
 # calls the same ingest() functions the CLI does. Nothing else here writes
 # anything, and both of these say so on the page.
 NAV_HELP = {
+    "backtest": "Has insider cluster buying actually worked? Every cluster since 2015, replayed as if bought at "
+                "the next open after it became public, with returns against SPY and IWM -- summarised by "
+                "holding period, by what was known at entry, by era, and out of sample from 2026-10-24. "
+                "Read the summaries first; the full list of clusters is below them.",
     "signals": "Curated queries that turn raw filings into something worth reading, ordered "
                "roughly by how much the signal is worth. Start here. Each view's thresholds "
                "are editable, so you can see how sensitive a result is to where you draw the line.",
@@ -322,6 +326,9 @@ COLUMN_HELP = {
     "reliability": "Whether the number of clusters is enough to tell a real effect from luck. A few "
                    "weeks of overlapping events from one market is a small sample whatever the count.",
     "group": "A slice of the clusters, to see which kinds have done better.",
+    "screen": "A screen being tested: a rule for which clusters to buy. All clusters is the baseline to beat.",
+    "period": "Which clusters: all of them, the early or later years, or only those since the screens were "
+              "chosen (out of sample -- the real test).",
     "net_funds": "Institutions that opened or added to a position, minus those that cut or closed one, "
                  "in the latest 13F quarter -- among every manager that filed both quarters. Above zero: "
                  "institutions were net accumulating.",
@@ -426,25 +433,6 @@ VIEWS = [
        "to a position than cut or closed one. 13F data is quarterly and lags by months, so read it as "
        "what funds were doing before the insiders bought, not alongside them.",
        date_filters=("first_buy", "last_buy")),
-    _v("backtest", "Backtest: cluster buys", lambda conn, min_insiders=2, hide_noise=1: backtest.events(
-           conn, min(max(min_insiders, backtest.LEVELS[0]), backtest.LEVELS[-1]), hide_noise),
-       [Param("min_insiders", "min insiders", 2, int,
-              "How many different insiders make a cluster: 2, 3 or 4. Each is dated by the filing that "
-              "brought in the last of them -- the first day anyone could have acted on it -- so a 3-insider "
-              "cluster is entered later than the same cluster at 2."),
-        Param("hide_noise", "hide noise", 1, int,
-              "1 hides clusters flagged as probably not discretionary buying: a fund's directors (funds "
-              "buy their own shares routinely), or every insider at one price on one day (an IPO "
-              "allocation, placement or purchase plan). 0 shows them, with the reason in flags.")],
-       ["ticker", "issuer_name", "known_on", "entry_date", "insiders", "buyers", "total_value", "prior_30d",
-        "ret_5d", "ret_10d", "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm", "days_held",
-        "status", "flags"],
-       "Every insider cluster buy in the database, replayed as if you had bought at the next open after "
-       "it became public, with its returns since -- against SPY and IWM. Years of history are stored; "
-       "the last few months are recomputed each time you open it.",
-       "How the cluster-buy signal has actually done since each cluster became public. Read the summary "
-       "first: it says how many clusters each figure rests on and whether that is enough to mean anything.",
-       takes_since=False, date_filters=("known_on",)),
     _v("large_buys", "Large officer / director purchases", signals.large_buys,
        [Param("min_value", "min $", config.LARGE_BUY_USD, float,
               "Smallest purchase to include, in dollars. Lower it to see more; raise it to keep "
@@ -508,7 +496,28 @@ VIEWS = [
        "latest quarter against the one before.",
        takes_since=False),
 ]
-VIEWS_BY_KEY = {v.key: v for v in VIEWS}
+# The backtest has its own top-level tab (it answers "has this worked?", not "what's happening
+# now?"), but shares the Signals page machinery: filters, sorting, CSV.
+BACKTEST_VIEW = _v("backtest", "Backtest: cluster buys", lambda conn, min_insiders=2, hide_noise=1: backtest.events(
+                       conn, min(max(min_insiders, backtest.LEVELS[0]), backtest.LEVELS[-1]), hide_noise),
+                   [Param("min_insiders", "min insiders", 2, int,
+                          "How many different insiders make a cluster: 2, 3 or 4. Each is dated by the filing that "
+                          "brought in the last of them -- the first day anyone could have acted on it -- so a 3-insider "
+                          "cluster is entered later than the same cluster at 2."),
+                    Param("hide_noise", "hide noise", 1, int,
+                          "1 hides clusters flagged as probably not discretionary buying: a fund's directors (funds "
+                          "buy their own shares routinely), or every insider at one price on one day (an IPO "
+                          "allocation, placement or purchase plan). 0 shows them, with the reason in flags.")],
+                   ["ticker", "issuer_name", "known_on", "entry_date", "insiders", "buyers", "total_value", "prior_30d",
+                    "ret_5d", "ret_10d", "ret_20d", "ret_60d", "ret_120d", "ret_to_date", "vs_spy", "vs_iwm", "days_held",
+                    "status", "flags"],
+                   "Every insider cluster buy in the database, replayed as if you had bought at the next open after "
+                   "it became public, with its returns since -- against SPY and IWM. Years of history are stored; "
+                   "the last few months are recomputed each time you open it.",
+                   "How the cluster-buy signal has actually done since each cluster became public. Read the summary "
+                   "first: it says how many clusters each figure rests on and whether that is enough to mean anything.",
+                   takes_since=False, date_filters=("known_on",))
+VIEWS_BY_KEY = {v.key: v for v in [*VIEWS, BACKTEST_VIEW]}
 DIAGRAM = """      SEC EDGAR              House Clerk              Senate eFD
      Form 4, 13F            yearly PTR ZIP         CSRF search form
    (XML per filing)        (PDF per filing)         (HTML tables)
@@ -1442,9 +1451,10 @@ def _presets(view_key) -> str:
     return f'<p class="note">Screens: {" &middot; ".join(links)}</p>' if links else ""
 
 
-def _backtest_summary(conn, rows) -> str:
-    """The headline tables above the Backtest list. Keeps itself current: recent clusters' prices
-    are topped up in the background, and the stored history is refreshed if it's over a week old."""
+def _backtest_head(conn, rows) -> str:
+    """The note at the top of every Backtest sub-tab. Keeps the results current on its own: recent
+    clusters' prices are topped up in the background, and the stored history is refreshed if it's
+    over a week old."""
     cutoff = (dt.date.today() - dt.timedelta(days=backtest.LIVE_DAYS)).isoformat()
     recent = [r["ticker"] for r in rows if r["known_on"] >= cutoff]
     notes = []
@@ -1461,29 +1471,84 @@ def _backtest_summary(conn, rows) -> str:
     first = signals.data_start(conn) or "-"
     priced = [r for r in rows if r.get("status") == "open"]
     missing = sum(1 for r in rows if r.get("status") == "no prices")
-    head = (f'<p class="note">{len(rows):,} clusters since {_esc(first)}, each bought at the next open after it became '
+    return (f'<p class="note">{len(rows):,} clusters since {_esc(first)}, each bought at the next open after it became '
             f"public; {len(priced):,} have prices. "
             + (f"{missing:,} have no price history (often delisted) and are left out, which flatters the results. "
                if missing else "")
             + f"History last updated: {_esc((last or 'never')[:16].replace('T', ' '))}."
             + "".join(f" <strong>{_esc(n)}</strong>" for n in notes) + "</p>")
-    group_cols = ["group", "events", "avg_vs_iwm", "median_vs_iwm", "beat_iwm", "reliability"]
-    return (head
-            + _table(backtest.summary(rows), ["horizon", "events", "median_return", "mean_return", "beat_spy",
-                                              "median_vs_spy", "median_vs_iwm", "reliability"])
-            + f'<p class="note" style="border-bottom:none">Which kinds of cluster did better: excess return over IWM '
-              f"{backtest.FACTOR_HORIZON} trading days after entry, by what was known at entry. The average (extremes "
-              "trimmed) is what holding all of them earned; the median is the typical one -- usually lower, "
-              "because a minority of big winners lifts the average:</p>"
-            + _table(backtest.groups(rows), group_cols)
-            + f'<p class="note" style="border-bottom:none">The live test: clusters since {backtest.TRACK_FROM}, when the '
-              "CFO screen was picked from the history above. Only these say whether it holds up going forward; "
-              "expect months before there are enough.</p>"
-            + _table(backtest.out_of_sample(rows), group_cols)
-            + '<p class="note" style="border-bottom:none">The same, early years against later ones. A difference that '
-              "shows up in only one period was probably luck; one that holds in both is worth trusting:</p>"
-            + _table(backtest.by_period(rows), group_cols)
-            + '<p class="note" style="border-bottom:none">Every cluster:</p>')
+
+
+BT_TABS = [
+    ("summary", "Summary", "Does insider cluster buying work at all? Every cluster's return at each holding period, "
+                           "against SPY and IWM."),
+    ("screens", "Screens", "Do the screens beat plain cluster buying, and are they still working? Each screen side by "
+                           "side, in each period -- including out of sample, the clusters since the screen was chosen. "
+                           "Check this one every few weeks."),
+    ("factors", "Factors", "What separates the clusters that did well? Every trait known at entry, and whether its "
+                           "difference held in both 2015-2020 and 2021 on."),
+    ("clusters", "Clusters", "Every cluster, with its entry date and returns: the evidence behind the other tabs. "
+                             "Filter, sort, or download as CSV."),
+]
+BT_HORIZONS = {5: "1 week", 10: "2 weeks", 20: "1 month", 60: "3 months", 120: "6 months"}
+GROUP_COLS = ["group", "events", "avg_vs_iwm", "median_vs_iwm", "beat_iwm", "reliability"]
+AVG_VS_MEDIAN = ("The average (extremes trimmed) is what holding all of them earned; the median is the typical one -- "
+                 "usually lower, because a minority of big winners lifts the average.")
+
+
+def page_backtest(conn, qs):
+    """The Backtest tab: one question per sub-tab, sharing min insiders, hide noise and the holding
+    period."""
+    tab = _one(qs, "tab", "summary")
+    tab = tab if tab in {k for k, _, _ in BT_TABS} else "summary"
+    level = min(max(_one(qs, PARAM_PREFIX + "min_insiders", 2, int), backtest.LEVELS[0]), backtest.LEVELS[-1])
+    hide = _one(qs, PARAM_PREFIX + "hide_noise", 1, int)
+    h = _one(qs, "h", backtest.FACTOR_HORIZON, int)
+    h = h if h in BT_HORIZONS else backtest.FACTOR_HORIZON
+    keep = {PARAM_PREFIX + "min_insiders": level, PARAM_PREFIX + "hide_noise": hide, "h": h}
+    subtabs = '<div class="tabs">' + "".join(
+        f'<a href="/backtest?{_qs(tab=k, **keep)}"{ON if k == tab else ""}{_tip(tip)}>{_esc(label)}</a>'
+        for k, label, tip in BT_TABS) + "</div>"
+    if tab == "clusters":
+        return page_signals(conn, qs, BACKTEST_VIEW, "/backtest", "backtest", subtabs=subtabs,
+                            hidden={"tab": "clusters", "h": h})
+
+    rows = backtest.events(conn, level, hide)
+    insiders_tip = next(p.tip for p in BACKTEST_VIEW.params if p.name == "min_insiders")
+    noise_tip = next(p.tip for p in BACKTEST_VIEW.params if p.name == "hide_noise")
+    horizon = "" if tab == "summary" else (
+        f'<label{_tip("How long each cluster is held before its return is measured. The Summary tab shows them all.")}>'
+        f'held <select name="h">' + "".join(f'<option value="{k}"{" selected" if k == h else ""}>{v}</option>'
+                                           for k, v in BT_HORIZONS.items()) + "</select></label>")
+    form = (f'<form class="bar" method="get" action="/backtest"><input type="hidden" name="tab" value="{tab}">'
+            f'<label{_tip(insiders_tip)}>min insiders <input type="number" step="1" min="2" max="4" '
+            f'name="{PARAM_PREFIX}min_insiders" value="{level}"></label>'
+            f'<label{_tip(noise_tip)}>hide noise <input type="number" step="1" min="0" max="1" '
+            f'name="{PARAM_PREFIX}hide_noise" value="{hide}"></label>{horizon}'
+            f'<button type="submit"{_tip(CONTROL_HELP["apply"])}>Apply</button></form>')
+    held = BT_HORIZONS[h]
+    if tab == "summary":
+        content = (_table(backtest.summary(rows), ["horizon", "events", "median_return", "mean_return", "beat_spy",
+                                                   "median_vs_spy", "median_vs_iwm", "reliability"])
+                   + '<p class="note">IWM (small caps) is the fair yardstick: most clusters are small companies. '
+                     "Medians are the typical cluster; most clusters trail the index slightly, and the average is "
+                     "lifted by a minority of big winners.</p>")
+    elif tab == "screens":
+        content = (f'<p class="note" style="border-bottom:none">Each screen against IWM, held {held}. {AVG_VS_MEDIAN} '
+                   f"The out-of-sample row counts only clusters since {backtest.TRACK_FROM}, after the screens were chosen "
+                   "from this history: it's the real test, and it will take months to fill.</p>"
+                   + _table(backtest.screens(rows, h), ["screen", "period", "events", "avg_vs_iwm", "median_vs_iwm",
+                                                        "beat_iwm", "reliability"]))
+    else:  # factors
+        content = (f'<p class="note" style="border-bottom:none">Excess return over IWM, held {held}, by what was known '
+                   f"at entry. {AVG_VS_MEDIAN}</p>"
+                   + _table(backtest.groups(rows, h=h), GROUP_COLS)
+                   + '<p class="note" style="border-bottom:none">The same, early years against later ones. A difference '
+                     "that shows up in only one period was probably luck; one that holds in both is worth trusting:</p>"
+                   + _table(backtest.by_period(rows, h), GROUP_COLS))
+    body = subtabs + form + _backtest_head(conn, rows) + content
+    return _page(f"Backtest: {dict((k, l) for k, l, _ in BT_TABS)[tab]}", "backtest", body,
+                 meta=f"{len(rows):,} clusters")
 
 
 def _fund_note(conn) -> str:
@@ -1593,9 +1658,11 @@ def _db_file(conn) -> str:
 MAX_TABLE_ROWS = 1000  # more than this and a page gets slow to load and scroll; the CSV has everything
 
 
-def page_signals(conn, qs):
-    key = _one(qs, "view", VIEWS[0].key)
-    view = VIEWS_BY_KEY.get(key, VIEWS[0])
+def page_signals(conn, qs, view=None, path="/signals", nav="signals", subtabs=None, hidden=None):
+    """A Signals view (or, with view/path/nav, the Backtest tab, which uses the same machinery)."""
+    if view is None:
+        key = _one(qs, "view", VIEWS[0].key)
+        view = next((v for v in VIEWS if v.key == key), VIEWS[0])
     days, since = _window(qs)
 
     kwargs, controls = {}, []
@@ -1627,7 +1694,7 @@ def page_signals(conn, qs):
             market_note += (f'<p class="note">Checking {len(need):,} issuer{"s" if len(need) != 1 else ""} '
                             "with the SEC (company or fund?) in the background.</p>")
     if view.key == "backtest":
-        market_note = _backtest_summary(conn, all_rows) + market_note
+        market_note = _backtest_head(conn, all_rows) + market_note
     dfl = _read_date_filters(qs, view.date_filters)
     pool = _apply_date_filters(all_rows, dfl)  # date ranges narrow first, so dropdown options follow
     flt = _read_signal_filters(qs, view.cols)
@@ -1636,20 +1703,21 @@ def page_signals(conn, qs):
     rows = _sort_rows(rows, sort, direction)
     date_params = {f"{DATE_FILTER_PREFIX}{c}_{end}": v
                    for c, (lo, hi) in dfl.items() for end, v in (("from", lo), ("to", hi))}
-    base = dict(view=view.key, days=days, **_qparams(kwargs), **date_params,
+    base = dict(view=view.key, days=days, **(hidden or {}), **_qparams(kwargs), **date_params,
                 **{SIG_FILTER_PREFIX + c: v for c, v in flt.items()})
     filter_cells = {c: _filter_select(c, _apply_filters(pool, flt, skip=c), flt.get(c), "sigform")
                     for c in view.cols}
-    unfiltered = dict(view=view.key, days=days, sort=sort, dir=direction, **_qparams(kwargs),
+    unfiltered = dict(view=view.key, days=days, sort=sort, dir=direction, **(hidden or {}), **_qparams(kwargs),
                       **date_params)
-    clear_link = (f'<a href="/signals?{_qs(**unfiltered)}"'
+    clear_link = (f'<a href="{path}?{_qs(**unfiltered)}"'
                   f'{_tip("Remove every column filter; keeps the window, thresholds and sort.")}'
                   f'>clear filters</a>') if flt else ""
 
     tabs = "".join(
         f'<a href="/signals?{_qs(view=v.key, days=days)}"'
         f'{ON if v.key == view.key else ""}{_tip(v.tip)}>{_esc(v.title)}</a>'
-        for v in VIEWS)
+        for v in VIEWS) if nav == "signals" else ""
+    tabs_html = subtabs or (f'<div class="tabs">{tabs}</div>' if tabs else "")
 
     window_ctl = ("" if not view.takes_since else
                   f'<label{_tip(CONTROL_HELP["window"])}>window '
@@ -1664,22 +1732,22 @@ def page_signals(conn, qs):
     csv_href = f"/signals.csv?{_qs(sort=sort, dir=direction, **base)}"
     keep_sort = (f'<input type="hidden" name="sort" value="{_esc(sort)}">'
                  f'<input type="hidden" name="dir" value="{_esc(direction)}">') if sort else ""
-    body = f"""<div class="tabs">{tabs}</div>
-<form id="sigform" class="bar" method="get" action="/signals">
-  <input type="hidden" name="view" value="{_esc(view.key)}">{keep_sort}
+    body = f"""{tabs_html}
+<form id="sigform" class="bar" method="get" action="{path}">
+  <input type="hidden" name="view" value="{_esc(view.key)}">{keep_sort}{''.join(f'<input type="hidden" name="{_esc(k)}" value="{_esc(v)}">' for k, v in (hidden or {}).items())}
   {window_ctl}{''.join(controls)}{date_ctl}
   <button type="submit"{_tip(CONTROL_HELP['apply'])}>Apply</button>
   <a href="{_esc(csv_href)}"><button type="button" class="ghost"
      {_tip(CONTROL_HELP['csv'])}>CSV</button></a>
 </form>
 {f'<p class="note">{_esc(view.note)}</p>' if view.note else ''}{_presets(view.key)}{market_note}
-{_table(rows[:MAX_TABLE_ROWS], view.cols, sort_href=_sorter("/signals", base), sort_col=sort, sort_dir=direction,
+{_table(rows[:MAX_TABLE_ROWS], view.cols, sort_href=_sorter(path, base), sort_col=sort, sort_dir=direction,
         filter_cells=filter_cells)}
 <div class="count"><span>{f"{len(rows):,} of {len(all_rows):,} rows" if (flt or dfl) else f"{len(rows):,} rows"}{f" -- showing the first {MAX_TABLE_ROWS:,}; sort or filter to see others, or download the CSV for all" if len(rows) > MAX_TABLE_ROWS else ""}</span>
   {clear_link}
   {'<span' + _tip("Only trades on or after this date are included. Change it with the window "
                   "control above.") + '>since ' + since + '</span>' if view.takes_since else ''}</div>"""
-    return _page(view.title, "signals", body, meta=f"{len(rows):,} rows")
+    return _page(view.title, nav, body, meta=f"{len(rows):,} rows")
 
 
 RANGES = {"3m": ("3M", 92), "6m": ("6M", 183), "1y": ("1Y", 366), "5y": ("5Y", 1830)}
@@ -2595,8 +2663,16 @@ class _Handler(BaseHTTPRequestHandler):
             return
         conn = _connect(self.db_path, read_only=True)
         try:
+            if route == "/signals" and _one(qs, "view") == "backtest":  # moved to its own tab
+                self.send_response(301)
+                self.send_header("Location", "/backtest?" + urllib.parse.urlparse(self.path).query)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if route in ("/", "/signals"):
                 html_out = page_signals(conn, qs)
+            elif route == "/backtest":
+                html_out = page_backtest(conn, qs)
             elif route == "/signals.csv":
                 view = VIEWS_BY_KEY.get(_one(qs, "view", ""), VIEWS[0])
                 days, since = _window(qs)

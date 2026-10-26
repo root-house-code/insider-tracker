@@ -98,7 +98,13 @@ A plain HTML UI over the same database.
   - **buyers:** for each insider, whether this purchase was their *first* in three years, a
     *routine* one (same month each year, little information), or *occasional*;
   - the backtest below.
-- **Backtest: cluster buys** (a Signals view) - how every cluster has done since it became public.
+- **Backtest** (its own tab, after Signals) - how every cluster has done since it became public.
+  It has four sub-tabs, which share the min insiders, hide noise and holding-period settings:
+  - **Summary:** does cluster buying work at all? Returns at each holding period, against SPY and IWM.
+  - **Screens:** each screen (all clusters, CFO buying, CFO mid-quarter) side by side, for 2015 to
+    now, 2015-2020, 2021 on, and out of sample since 2026-10-24.
+  - **Factors:** every trait known at entry, and whether its edge held in both periods.
+  - **Clusters:** the full list, with filters, sorting and CSV.
   - **Entry:** the next open after the filing that made it a cluster. Using trade dates would flatter
     the results.
   - **Returns:** after 5, 10, 20, 60 and 120 trading days and to date, against SPY and IWM.
